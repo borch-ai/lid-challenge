@@ -1,0 +1,24 @@
+# Binaries
+bin/
+lid-server
+
+# Test coverage
+coverage.out
+*.out
+*.html
+
+# SQLite database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment & local files
+.env
+.env.local
+
+# OS & Editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

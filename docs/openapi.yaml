@@ -1,0 +1,559 @@
+openapi: 3.1.0
+info:
+  title: "LID Challenge: User Profile & Identity Service API"
+  description: |
+    Production-grade RESTful web service for managing user profiles, authentication credentials,
+    parameterized profile queries across relational databases (PostgreSQL, CockroachDB, SQLite),
+    and integrating with 3rd-party identity providers (ABC / XYZ).
+  version: 1.0.0
+  contact:
+    name: Daniel Borch
+    url: https://github.com/borch-ai/lid-challenge
+
+servers:
+  - url: http://localhost:8080
+    description: Localhost development server
+  - url: http://lid-server.orb.local:8080
+    description: OrbStack native domain
+
+tags:
+  - name: Health & Probes
+    description: Operational liveness and readiness health checks
+  - name: Authentication
+    description: User registration and password authentication
+  - name: Profiles
+    description: Protected user profile retrieval and search
+  - name: 3rd-Party Vendor IDP
+    description: Standardized vendor identity provider protocols (ABC / XYZ)
+
+paths:
+  /api/v1/health:
+    get:
+      tags:
+        - Health & Probes
+      summary: Liveness Probe
+      description: Returns 200 OK if the HTTP listener is alive and handling traffic.
+      responses:
+        '200':
+          description: Service is alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /api/v1/ready:
+    get:
+      tags:
+        - Health & Probes
+      summary: Readiness Probe
+      description: Verifies downstream database connectivity by executing an atomic ping against the connection pool.
+      responses:
+        '200':
+          description: Service and database connection pool are healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyResponse'
+        '503':
+          description: Database is unreachable or pool is degraded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyResponse'
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/openapi.yaml:
+    get:
+      tags:
+        - Health & Probes
+      summary: OpenAPI Specification
+      description: Returns the raw OpenAPI 3.1.0 specification document in YAML format.
+      responses:
+        '200':
+          description: OpenAPI 3.1.0 Specification in YAML
+          content:
+            application/yaml:
+              schema:
+                type: string
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/users:
+    post:
+      tags:
+        - Authentication
+      summary: Register User Profile & Credentials
+      description: Atomically creates a user profile and associated login credential using salted bcrypt hashing.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateUserRequest'
+      responses:
+        '201':
+          description: User profile and credentials created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateUserResponse'
+        '400':
+          description: Invalid payload or validation failure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Username is already registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/auth/login:
+    post:
+      tags:
+        - Authentication
+      summary: Authenticate User Credentials
+      description: Validates username and password against the stored bcrypt hash and issues an access token.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Authentication successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '400':
+          description: Malformed request payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Invalid username or password
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/profiles/{id}:
+    get:
+      tags:
+        - Profiles
+      summary: Get User Profile by ID
+      description: Retrieves the user profile matching the specified UUID. Requires Bearer token authentication. Standard user tokens are restricted to their own profile (claims.sub == id); administrative access via master AuthSecret can retrieve any profile.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: UUID of the user profile
+          schema:
+            type: string
+            format: uuid
+            example: "40e7cfa5-a96e-4016-abd9-d9b1a7cf3a58"
+      responses:
+        '200':
+          description: User profile retrieved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+        '401':
+          description: Missing or invalid Bearer authentication token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Forbidden (cross-user profile access attempt with user token)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: User profile not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/profiles:
+    get:
+      tags:
+        - Profiles
+      summary: Search User Profiles
+      description: Performs parameterized search across user profiles with pagination. Restricted to administrative access via master AuthSecret. Standard user tokens are rejected with 403 Forbidden to prevent mass PII enumeration.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: name
+          in: query
+          description: Filter profiles by name substring (case-insensitive)
+          schema:
+            type: string
+            example: "Alice"
+        - name: phone
+          in: query
+          description: Filter profiles by phone number substring
+          schema:
+            type: string
+            example: "3035551111"
+        - name: locality
+          in: query
+          description: Filter profiles by locality / city
+          schema:
+            type: string
+            example: "Denver"
+        - name: region
+          in: query
+          description: Filter profiles by state or region code
+          schema:
+            type: string
+            example: "CO"
+        - name: country
+          in: query
+          description: Filter profiles by country
+          schema:
+            type: string
+            example: "USA"
+        - name: limit
+          in: query
+          description: Maximum number of records to return (clamped 1-100, default 20)
+          schema:
+            type: integer
+            default: 20
+            minimum: 1
+            maximum: 100
+        - name: offset
+          in: query
+          description: Number of records to skip for pagination (clamped 0-10000, default 0)
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+            maximum: 10000
+      responses:
+        '200':
+          description: List of matching user profiles
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchResponse'
+        '401':
+          description: Missing or invalid Bearer authentication token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Forbidden (user tokens cannot perform directory search; administrative master secret required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: Custom
+      description: "Signed per-user Bearer token formatted as base64url(payload).base64url(hmac-sha256) with 24h expiration (or master service AuthSecret)"
+
+  schemas:
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - timestamp
+      properties:
+        status:
+          type: string
+          example: "healthy"
+        timestamp:
+          type: string
+          format: date-time
+          example: "2026-09-11T21:50:00Z"
+
+    ReadyResponse:
+      type: object
+      required:
+        - status
+        - database
+        - timestamp
+      properties:
+        status:
+          type: string
+          example: "ready"
+        database:
+          type: string
+          example: "healthy"
+        timestamp:
+          type: string
+          format: date-time
+          example: "2026-09-11T21:50:00Z"
+        error:
+          type: string
+          example: "database connection timeout"
+
+    Address:
+      type: object
+      required:
+        - street_address
+        - locality
+        - region
+        - postal_code
+        - country
+      properties:
+        street_address:
+          type: string
+          maxLength: 500
+          example: "123 Denver St"
+        locality:
+          type: string
+          maxLength: 128
+          example: "Denver"
+        region:
+          type: string
+          maxLength: 128
+          example: "CO"
+        postal_code:
+          type: string
+          maxLength: 32
+          example: "80202"
+        country:
+          type: string
+          maxLength: 64
+          example: "USA"
+
+    UserProfile:
+      type: object
+      required:
+        - id
+        - name
+        - phone
+        - address
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: "40e7cfa5-a96e-4016-abd9-d9b1a7cf3a58"
+        name:
+          type: string
+          example: "Alice Smith"
+        phone:
+          type: string
+          example: "3035551111"
+        address:
+          $ref: '#/components/schemas/Address'
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-09-11T21:50:00Z"
+        updated_at:
+          type: string
+          format: date-time
+          example: "2026-09-11T21:50:00Z"
+
+    CreateUserRequest:
+      type: object
+      required:
+        - name
+        - phone
+        - address
+        - username
+        - password
+      properties:
+        name:
+          type: string
+          example: "Alice Smith"
+        phone:
+          type: string
+          example: "3035551111"
+        address:
+          $ref: '#/components/schemas/Address'
+        username:
+          type: string
+          example: "alice"
+        password:
+          type: string
+          format: password
+          description: Plaintext user password (maximum 72 bytes due to bcrypt limitation).
+          example: "Password123!"
+
+    CreateUserResponse:
+      type: object
+      required:
+        - user_id
+        - profile
+      properties:
+        user_id:
+          type: string
+          format: uuid
+          example: "40e7cfa5-a96e-4016-abd9-d9b1a7cf3a58"
+        profile:
+          $ref: '#/components/schemas/UserProfile'
+
+    LoginRequest:
+      type: object
+      required:
+        - username
+        - password
+      properties:
+        username:
+          type: string
+          example: "alice"
+        password:
+          type: string
+          format: password
+          description: Plaintext user password (maximum 72 bytes due to bcrypt limitation).
+          example: "Password123!"
+
+    LoginResponse:
+      type: object
+      required:
+        - access_token
+        - profile
+      properties:
+        access_token:
+          type: string
+          description: "Signed per-user HMAC-SHA256 Bearer access token with 24-hour expiration"
+          example: "eyJzdWIiOiI0MGU3Y2ZhNS1hOTZlLTQwMTYtYWJkOS1kOWIxYTdjZjNhNTgiLCJ1c3IiOiJhbGljZSIsImV4cCI6MTc4OTE3NzA0MX0.signature"
+        profile:
+          $ref: '#/components/schemas/UserProfile'
+
+    SearchResponse:
+      type: object
+      required:
+        - data
+        - count
+        - limit
+        - offset
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserProfile'
+        count:
+          type: integer
+          example: 1
+        limit:
+          type: integer
+          example: 20
+        offset:
+          type: integer
+          example: 0
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+        - code
+      properties:
+        error:
+          type: string
+          example: "unauthorized access"
+        code:
+          type: string
+          example: "UNAUTHORIZED"
+        details:
+          type: string
+          example: "invalid or expired bearer token"
+
+    VendorAuthRequest:
+      type: object
+      required:
+        - username
+        - password
+      properties:
+        username:
+          type: string
+          example: "abc_client"
+        password:
+          type: string
+          format: password
+          example: "abc_secret"
+
+    VendorAuthResponse:
+      type: object
+      required:
+        - access_token
+      properties:
+        access_token:
+          type: string
+          example: "mock-jwt-token-vendor-abc"
+        expires_in:
+          type: integer
+          example: 3600
+
+    VendorIdentityRequest:
+      type: object
+      required:
+        - name
+        - phone
+      properties:
+        name:
+          type: string
+          example: "Daniel Borch"
+        phone:
+          type: string
+          example: "3035551234"
+
+    VendorIdentityResponse:
+      type: object
+      required:
+        - name
+        - phone
+        - address
+      properties:
+        name:
+          type: string
+          example: "Daniel Borch"
+        phone:
+          type: string
+          example: "3035551234"
+        address:
+          $ref: '#/components/schemas/Address'

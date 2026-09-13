@@ -36,7 +36,7 @@ func main() {
 			if req.Username == "abc_client" && req.Password == "abc_secret" {
 				w.Header().Set("Content-Type", "application/json")
 				expiresIn := 3600
-				_ = json.NewEncoder(w).Encode(connector.AuthResponse{
+				_ = json.NewEncoder(w).Encode(connector.AuthResponse{ //nolint:gosec // G117: mock test server authentication response
 					AccessToken: "mock-jwt-token-vendor-abc",
 					ExpiresIn:   &expiresIn,
 				})
@@ -46,7 +46,7 @@ func main() {
 
 		case "/identity":
 			token := r.Header.Get("Authorization")
-			if token != "Bearer mock-jwt-token-vendor-abc" {
+			if token != "Bearer mock-jwt-token-vendor-abc" { //nolint:gosec // G101: mock test fixture token comparison
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}

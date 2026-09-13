@@ -24,10 +24,6 @@ linters:
           disabled: true
         - name: unused-parameter
           disabled: true
-    gosec:
-      excludes:
-        - G101
-        - G117
 
 issues:
   exclude-use-default: false

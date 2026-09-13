@@ -58,19 +58,15 @@ lint:
 	@GOBIN=$$(go env GOBIN); \
 	GOPATH=$$(go env GOPATH); \
 	if [ -z "$$GOBIN" ]; then GOBIN=$$GOPATH/bin; fi; \
-	if command -v golangci-lint >/dev/null 2>&1; then \
-		golangci-lint run; \
-	elif [ -f "$$GOBIN/golangci-lint" ]; then \
-		$$GOBIN/golangci-lint run; \
-	else \
-		echo "golangci-lint not found in PATH or GOBIN. Installing pinned version @v2.12.2..."; \
+	if [ ! -f "$$GOBIN/golangci-lint" ]; then \
+		echo "golangci-lint not found in $$GOBIN. Installing pinned version @v2.12.2..."; \
 		go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2; \
-		if [ -f "$$GOBIN/golangci-lint" ]; then \
-			$$GOBIN/golangci-lint run; \
-		else \
-			echo "Error: failed to install or execute golangci-lint" >&2; \
-			exit 1; \
-		fi; \
+	fi; \
+	if [ -f "$$GOBIN/golangci-lint" ]; then \
+		"$$GOBIN/golangci-lint" run; \
+	else \
+		echo "Error: failed to install or execute pinned golangci-lint at $$GOBIN/golangci-lint" >&2; \
+		exit 1; \
 	fi
 
 ## Run vulnerability check

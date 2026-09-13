@@ -150,7 +150,7 @@ func (c *BaseConnector) Authenticate(ctx context.Context, username, password str
 		Username: username,
 		Password: password,
 	}
-	jsonBody, err := json.Marshal(payload)
+	jsonBody, err := json.Marshal(payload) //nolint:gosec // G117: outbound vendor authentication request requires marshaling credentials
 	if err != nil {
 		return "", fmt.Errorf("failed to encode auth request: %w", err)
 	}

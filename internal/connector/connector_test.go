@@ -33,7 +33,7 @@ func TestConnector_AuthenticateAndGetIdentity(t *testing.T) {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 
 		if req.Username == "good-user" && req.Password == "good-pass" {
-			_ = json.NewEncoder(w).Encode(AuthResponse{
+			_ = json.NewEncoder(w).Encode(AuthResponse{ //nolint:gosec // G117: mock vendor auth response
 				AccessToken: "token-abc-12345",
 				ExpiresIn:   intPtr(3600),
 			})
@@ -94,7 +94,7 @@ func TestConnector_GetIdentity_WithTokenCachingAndRetry(t *testing.T) {
 		switch r.URL.Path {
 		case "/auth":
 			atomic.AddInt32(&authCalls, 1)
-			_ = json.NewEncoder(w).Encode(AuthResponse{
+			_ = json.NewEncoder(w).Encode(AuthResponse{ //nolint:gosec // G117: mock vendor auth response
 				AccessToken: *validToken.Load(),
 				ExpiresIn:   intPtr(60),
 			})
@@ -162,7 +162,7 @@ func TestConnector_GetIdentity_WithTokenCachingAndRetry(t *testing.T) {
 	}
 
 	// 3. Invalidate token on server side: client should see 401, re-auth, and succeed
-	rotatedToken := "rotated-token-999"
+	rotatedToken := "rotated-token-999" //nolint:gosec // G101: mock token rotation fixture
 	validToken.Store(&rotatedToken)
 	res, err = conn.GetIdentity(context.Background(), "3035551234", "John Doe")
 	if err != nil {
@@ -196,7 +196,7 @@ func TestConnector_Singleflight(t *testing.T) {
 			atomic.AddInt32(&authCalls, 1)
 			// Simulate slight latency to test concurrency collapse
 			time.Sleep(50 * time.Millisecond)
-			_ = json.NewEncoder(w).Encode(AuthResponse{
+			_ = json.NewEncoder(w).Encode(AuthResponse{ //nolint:gosec // G117: mock vendor auth response
 				AccessToken: "shared-token",
 				ExpiresIn:   intPtr(300),
 			})
@@ -280,7 +280,7 @@ func TestConnector_ErrorHandling(t *testing.T) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(AuthResponse{AccessToken: ""})
+		_ = json.NewEncoder(w).Encode(AuthResponse{AccessToken: ""}) //nolint:gosec // G117: mock vendor auth response
 	}))
 	defer emptyTokenServer.Close()
 	connEmpty := NewBaseConnector(VendorConfig{BaseURL: emptyTokenServer.URL}, nil)
@@ -315,7 +315,7 @@ func TestConnector_ErrorHandling(t *testing.T) {
 	// 3. /identity 500 error
 	err500Server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/auth" {
-			_ = json.NewEncoder(w).Encode(AuthResponse{AccessToken: "token"})
+			_ = json.NewEncoder(w).Encode(AuthResponse{AccessToken: "token"}) //nolint:gosec // G117: mock vendor auth response
 			return
 		}
 		http.Error(w, "crash", http.StatusInternalServerError)
@@ -330,7 +330,7 @@ func TestConnector_ErrorHandling(t *testing.T) {
 	// 4. /identity bad JSON
 	badJSONIdentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/auth" {
-			_ = json.NewEncoder(w).Encode(AuthResponse{AccessToken: "token"})
+			_ = json.NewEncoder(w).Encode(AuthResponse{AccessToken: "token"}) //nolint:gosec // G117: mock vendor auth response
 			return
 		}
 		_, _ = w.Write([]byte("{invalid-json"))
@@ -345,7 +345,7 @@ func TestConnector_ErrorHandling(t *testing.T) {
 	// 5. /identity unexpected status (e.g. 418 Teapot)
 	teapotServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/auth" {
-			_ = json.NewEncoder(w).Encode(AuthResponse{AccessToken: "token"})
+			_ = json.NewEncoder(w).Encode(AuthResponse{AccessToken: "token"}) //nolint:gosec // G117: mock vendor auth response
 			return
 		}
 		http.Error(w, "I'm a teapot", http.StatusTeapot)
@@ -360,7 +360,7 @@ func TestConnector_ErrorHandling(t *testing.T) {
 	// 6. /identity 403 Forbidden returns ErrVendorForbidden without retry loop
 	forbiddenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/auth" {
-			_ = json.NewEncoder(w).Encode(AuthResponse{AccessToken: "token"})
+			_ = json.NewEncoder(w).Encode(AuthResponse{AccessToken: "token"}) //nolint:gosec // G117: mock vendor auth response
 			return
 		}
 		http.Error(w, "forbidden", http.StatusForbidden)
@@ -375,7 +375,7 @@ func TestConnector_ErrorHandling(t *testing.T) {
 	// 7. /identity missing required fields (e.g. empty JSON {})
 	emptyIdentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/auth" {
-			_ = json.NewEncoder(w).Encode(AuthResponse{AccessToken: "token"})
+			_ = json.NewEncoder(w).Encode(AuthResponse{AccessToken: "token"}) //nolint:gosec // G117: mock vendor auth response
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{})
@@ -415,7 +415,7 @@ func TestConnector_DoubleCheckCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if token != "cached-valid-token" {
+	if token != "cached-valid-token" { //nolint:gosec // G101: test fixture token
 		t.Errorf("got %q, want 'cached-valid-token'", token)
 	}
 }
@@ -479,7 +479,7 @@ func TestVendorConfig_JSONPasswordOmitted(t *testing.T) {
 
 func TestConnector_ExpiresInOverflowCap(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(AuthResponse{
+		_ = json.NewEncoder(w).Encode(AuthResponse{ //nolint:gosec // G117: mock vendor auth response
 			AccessToken: "huge-exp-token",
 			ExpiresIn:   intPtr(1 << 30), // huge value
 		})
@@ -496,7 +496,7 @@ func TestConnector_ExpiresInOverflowCap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if token != "huge-exp-token" {
+	if token != "huge-exp-token" { //nolint:gosec // G101: test fixture token
 		t.Errorf("got %q, want 'huge-exp-token'", token)
 	}
 	if conn.tokenExpiry.Before(time.Now()) {
@@ -507,7 +507,7 @@ func TestConnector_ExpiresInOverflowCap(t *testing.T) {
 func TestConnector_ExpiresInZeroOrOmitted(t *testing.T) {
 	// 1. Test expires_in: 0 -> token is returned but NOT cached
 	serverZero := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(AuthResponse{
+		_ = json.NewEncoder(w).Encode(AuthResponse{ //nolint:gosec // G117: mock vendor auth response
 			AccessToken: "zero-exp-token",
 			ExpiresIn:   intPtr(0),
 		})
@@ -533,7 +533,7 @@ func TestConnector_ExpiresInZeroOrOmitted(t *testing.T) {
 
 	// 2. Test expires_in omitted (nil) -> falls back to DefaultTokenTTL and caches
 	serverOmitted := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(AuthResponse{
+		_ = json.NewEncoder(w).Encode(AuthResponse{ //nolint:gosec // G117: mock vendor auth response
 			AccessToken: "default-ttl-token",
 			ExpiresIn:   nil,
 		})
@@ -563,7 +563,7 @@ func TestConnector_IdentityAddressValidation(t *testing.T) {
 	// Vendor returns identity with missing street_address
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/auth" {
-			_ = json.NewEncoder(w).Encode(AuthResponse{
+			_ = json.NewEncoder(w).Encode(AuthResponse{ //nolint:gosec // G117: mock vendor auth response
 				AccessToken: "test-token",
 				ExpiresIn:   intPtr(300),
 			})
@@ -634,7 +634,7 @@ func TestConnector_ZeroTTLInvalidatesCache(t *testing.T) {
 	currentTTL := 60
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/auth" {
-			_ = json.NewEncoder(w).Encode(AuthResponse{
+			_ = json.NewEncoder(w).Encode(AuthResponse{ //nolint:gosec // G117: mock vendor auth response
 				AccessToken: "active-token",
 				ExpiresIn:   &currentTTL,
 			})
@@ -739,7 +739,7 @@ func TestConnector_SchemeValidation(t *testing.T) {
 	// 5. Cleartext HTTP in development should succeed
 	t.Setenv("APP_ENV", "development")
 	localServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(AuthResponse{AccessToken: "tok"})
+		_ = json.NewEncoder(w).Encode(AuthResponse{AccessToken: "tok"}) //nolint:gosec // G117: mock vendor auth response
 	}))
 	defer localServer.Close()
 

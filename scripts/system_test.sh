@@ -64,6 +64,7 @@ else
   mkdir -p ./bin
   go build -o ./bin/lid-server ./cmd/server
   ACTUAL_DRIVER="${DB_DRIVER:-sqlite}"
+  NORMALIZED_DRIVER="$(echo "$ACTUAL_DRIVER" | tr '[:upper:]' '[:lower:]' | xargs)"
   if [ -n "${DB_DSN:-}" ]; then
     ALLOW_MUTATING_TESTS="${ALLOW_MUTATING_TESTS:-false}"
     if [ "$ALLOW_MUTATING_TESTS" != "true" ]; then
@@ -72,7 +73,7 @@ else
       exit 1
     fi
     ACTUAL_DSN="$DB_DSN"
-  elif [ "$ACTUAL_DRIVER" = "sqlite" ] || [ "$ACTUAL_DRIVER" = "sqlite3" ]; then
+  elif [ "$NORMALIZED_DRIVER" = "sqlite" ] || [ "$NORMALIZED_DRIVER" = "sqlite3" ]; then
     ACTUAL_DSN="$TEST_DB"
   else
     echo "Error: DB_DRIVER='$ACTUAL_DRIVER' requires an explicit DB_DSN connection string and ALLOW_MUTATING_TESTS=true."

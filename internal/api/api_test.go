@@ -142,7 +142,7 @@ func TestAPI_CreateUserAndLogin(t *testing.T) {
 			Country:       "USA",
 		},
 	}
-	body, _ := json.Marshal(userPayload)
+	body, _ := json.Marshal(userPayload) //nolint:gosec // G117: test fixture payload marshaling
 	req := httptest.NewRequestWithContext(context.Background(), "POST", "/api/v1/users", bytes.NewReader(body))
 	rec := httptest.NewRecorder()
 
@@ -174,7 +174,7 @@ func TestAPI_CreateUserAndLogin(t *testing.T) {
 		Username: "ghopper",
 		Password: "CompilerPioneer!",
 	}
-	loginBody, _ := json.Marshal(loginPayload)
+	loginBody, _ := json.Marshal(loginPayload) //nolint:gosec // G117: test fixture payload marshaling
 	reqLogin := httptest.NewRequestWithContext(context.Background(), "POST", "/api/v1/auth/login", bytes.NewReader(loginBody))
 	recLogin := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(recLogin, reqLogin)
@@ -200,7 +200,7 @@ func TestAPI_CreateUserAndLogin(t *testing.T) {
 		Username: "ghopper",
 		Password: "WrongPassword",
 	}
-	badLoginBody, _ := json.Marshal(badLoginPayload)
+	badLoginBody, _ := json.Marshal(badLoginPayload) //nolint:gosec // G117: test fixture payload marshaling
 	reqBadLogin := httptest.NewRequestWithContext(context.Background(), "POST", "/api/v1/auth/login", bytes.NewReader(badLoginBody))
 	recBadLogin := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(recBadLogin, reqBadLogin)
@@ -214,7 +214,7 @@ func TestAPI_CreateUserAndLogin(t *testing.T) {
 		Username: "nonexistent_user",
 		Password: "SomePassword123!",
 	}
-	noUserBody, _ := json.Marshal(noUserPayload)
+	noUserBody, _ := json.Marshal(noUserPayload) //nolint:gosec // G117: test fixture payload marshaling
 	reqNoUser := httptest.NewRequestWithContext(context.Background(), "POST", "/api/v1/auth/login", bytes.NewReader(noUserBody))
 	recNoUser := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(recNoUser, reqNoUser)

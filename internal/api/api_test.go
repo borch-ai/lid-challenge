@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -441,13 +442,49 @@ func TestAPI_ValidationErrorsAndPanics(t *testing.T) {
 		t.Errorf("expected 200 OK for health probe even when client rate limit is exhausted, got: %d", healthRec.Code)
 	}
 
-	// Readiness probe hits the database and is subject to rate limiting to prevent database DoS
+	// Readiness probe hits the database and is subject to rate limiting for external IPs to prevent database DoS
 	readyReq := httptest.NewRequestWithContext(context.Background(), "GET", "/api/v1/ready", nil)
 	readyReq.RemoteAddr = "192.168.1.100:12345"
 	readyRec := httptest.NewRecorder()
 	strictSrv.Handler().ServeHTTP(readyRec, readyReq)
 	if readyRec.Code != http.StatusTooManyRequests {
 		t.Errorf("expected 429 for readiness probe when client tokens are exhausted, got: %d", readyRec.Code)
+	}
+
+	// Readiness probe for local loopback (e.g. Docker container healthcheck) is exempt from rate limiting
+	localReadyReq := httptest.NewRequestWithContext(context.Background(), "GET", "/api/v1/ready", nil)
+	localReadyReq.RemoteAddr = "127.0.0.1:54321"
+	localReadyRec := httptest.NewRecorder()
+	strictSrv.Handler().ServeHTTP(localReadyRec, localReadyReq)
+	if localReadyRec.Code == http.StatusTooManyRequests {
+		t.Errorf("expected local readiness probe to be exempt from rate limiting, got 429")
+	}
+
+	// Verify dynamic Retry-After header with low RPS
+	lowRPSSrv, err := NewServer(nil, Config{
+		Port:           8080,
+		RateLimitRPS:   0.1, // 1 token per 10 seconds
+		RateLimitBurst: 1,
+	}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error creating low RPS server: %v", err)
+	}
+	lowRPSReq := httptest.NewRequestWithContext(context.Background(), "GET", "/api/v1/openapi.yaml", nil)
+	lowRPSReq.RemoteAddr = "10.0.0.1:12345"
+	recLow1 := httptest.NewRecorder()
+	lowRPSSrv.Handler().ServeHTTP(recLow1, lowRPSReq)
+	if recLow1.Code != http.StatusOK {
+		t.Fatalf("expected 200 for initial request, got: %d", recLow1.Code)
+	}
+	recLow2 := httptest.NewRecorder()
+	lowRPSSrv.Handler().ServeHTTP(recLow2, lowRPSReq)
+	if recLow2.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 for rate limited request, got: %d", recLow2.Code)
+	}
+	retryAfterStr := recLow2.Header().Get("Retry-After")
+	retryAfterVal, err := strconv.Atoi(retryAfterStr)
+	if err != nil || retryAfterVal < 9 || retryAfterVal > 11 {
+		t.Errorf("expected Retry-After to be approx 10 seconds for 0.1 RPS, got: %q", retryAfterStr)
 	}
 
 	// 3b. Rate limiter burst normalization (burst < 1 normalized to at least 1)

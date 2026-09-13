@@ -60,11 +60,9 @@ else
     echo "Error: Port $TEST_PORT is already occupied by a running service at $BASE_URL. Please set TEST_PORT to an unused port or terminate the existing process."
     exit 1
   fi
-  if [ ! -f "./bin/lid-server" ]; then
-    echo "Binary not found, compiling ./bin/lid-server..."
-    mkdir -p ./bin
-    go build -o ./bin/lid-server ./cmd/server
-  fi
+  echo "Compiling ./bin/lid-server from current source..."
+  mkdir -p ./bin
+  go build -o ./bin/lid-server ./cmd/server
   ACTUAL_DRIVER="${DB_DRIVER:-sqlite}"
   if [ -n "${DB_DSN:-}" ]; then
     ALLOW_MUTATING_TESTS="${ALLOW_MUTATING_TESTS:-false}"
@@ -74,8 +72,11 @@ else
       exit 1
     fi
     ACTUAL_DSN="$DB_DSN"
-  else
+  elif [ "$ACTUAL_DRIVER" = "sqlite" ] || [ "$ACTUAL_DRIVER" = "sqlite3" ]; then
     ACTUAL_DSN="$TEST_DB"
+  else
+    echo "Error: DB_DRIVER='$ACTUAL_DRIVER' requires an explicit DB_DSN connection string and ALLOW_MUTATING_TESTS=true."
+    exit 1
   fi
   echo "Using database driver: $ACTUAL_DRIVER"
   APP_ENV="${APP_ENV:-test}" SERVER_PORT="$TEST_PORT" DB_DRIVER="$ACTUAL_DRIVER" DB_DSN="$ACTUAL_DSN" AUTH_SECRET="$AUTH_SECRET" ./bin/lid-server &

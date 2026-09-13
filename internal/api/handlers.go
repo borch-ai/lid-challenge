@@ -37,6 +37,16 @@ type ReadyResponse struct {
 }
 
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if s.dao == nil {
+		writeJSON(w, http.StatusServiceUnavailable, ReadyResponse{
+			Status:    "unready",
+			Database:  "unreachable",
+			Timestamp: time.Now().UTC(),
+			Error:     "database not configured",
+		})
+		return
+	}
+
 	if err := s.dao.Ping(r.Context()); err != nil {
 		s.logger.Error("readiness probe failed: database unreachable", "error", err)
 		writeJSON(w, http.StatusServiceUnavailable, ReadyResponse{

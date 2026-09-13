@@ -3,8 +3,10 @@ package api
 import (
 	"context"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -202,6 +204,13 @@ func (rl *RateLimiter) pushFront(node *clientLimiter) {
 
 // Allow checks if the given IP is allowed to execute a request.
 func (rl *RateLimiter) Allow(ip string) bool {
+	allowed, _ := rl.AllowWithRetryAfter(ip)
+	return allowed
+}
+
+// AllowWithRetryAfter checks if the given IP is allowed to execute a request,
+// and returns the recommended Retry-After delay in integer seconds when rejected.
+func (rl *RateLimiter) AllowWithRetryAfter(ip string) (bool, int) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
@@ -249,7 +258,7 @@ func (rl *RateLimiter) Allow(ip string) bool {
 		}
 		rl.pushFront(limiter)
 		rl.clients[ip] = limiter
-		return true
+		return true, 0
 	}
 
 	rl.moveToFront(limiter)
@@ -264,10 +273,21 @@ func (rl *RateLimiter) Allow(ip string) bool {
 
 	if limiter.tokens >= 1 {
 		limiter.tokens--
-		return true
+		return true, 0
 	}
 
-	return false
+	retryAfter := 1
+	if rl.rate > 0 {
+		needed := 1.0 - limiter.tokens
+		if needed > 0 {
+			sec := math.Ceil(needed / rl.rate)
+			if sec > 1 {
+				retryAfter = int(sec)
+			}
+		}
+	}
+
+	return false, retryAfter
 }
 
 // isTrustedIP reports whether the given IP falls within any configured trusted proxy network.
@@ -321,7 +341,9 @@ func (s *Server) clientIP(r *http.Request) string {
 
 // WithRateLimit wraps a handler to limit requests per IP address.
 // Lightweight liveness probe (/api/v1/health) is exempt from throttling so orchestrator probes remain uninterrupted.
-// Note: /api/v1/ready performs a database ping and remains subject to rate limiting to prevent database connection exhaustion.
+// Local loopback readiness probe (/api/v1/ready) is also exempt from throttling so container orchestration healthchecks
+// (e.g. Docker/Kubernetes) remain healthy even under low RATE_LIMIT_RPS configurations.
+// External /api/v1/ready calls from non-loopback IPs remain subject to rate limiting to prevent database connection exhaustion.
 func (s *Server) WithRateLimit(next http.Handler) http.Handler {
 	if s.limiter == nil {
 		return next
@@ -336,8 +358,17 @@ func (s *Server) WithRateLimit(next http.Handler) http.Handler {
 
 		ip := s.clientIP(r)
 
-		if !s.limiter.Allow(ip) {
-			w.Header().Set("Retry-After", "1")
+		// Exempt local loopback readiness probe from throttling so container health checks stay healthy
+		if r.URL.Path == "/api/v1/ready" {
+			if parsedIP := net.ParseIP(ip); parsedIP != nil && parsedIP.IsLoopback() {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+
+		allowed, retryAfter := s.limiter.AllowWithRetryAfter(ip)
+		if !allowed {
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 			writeError(w, http.StatusTooManyRequests, "rate limit exceeded", "RATE_LIMIT_EXCEEDED")
 			return
 		}

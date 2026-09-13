@@ -2,6 +2,8 @@ BINARY_NAME=lid-server
 BUILD_DIR=./bin
 COVERAGE_FILE=coverage.out
 COVERAGE_THRESHOLD=91.0
+GOLANGCI_LINT_VERSION ?= v2.12.2
+GOVULNCHECK_VERSION   ?= v1.1.4
 
 .PHONY: all build test test-system check-coverage lint vuln fmt tidy clean docker-up docker-down run sync-openapi
 
@@ -58,9 +60,11 @@ lint:
 	@GOBIN=$$(go env GOBIN); \
 	GOPATH=$$(go env GOPATH); \
 	if [ -z "$$GOBIN" ]; then GOBIN=$$GOPATH/bin; fi; \
-	if [ ! -f "$$GOBIN/golangci-lint" ]; then \
-		echo "golangci-lint not found in $$GOBIN. Installing pinned version @v2.12.2..."; \
-		go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2; \
+	TARGET_VER="$(GOLANGCI_LINT_VERSION)"; \
+	CLEAN_VER=$${TARGET_VER#v}; \
+	if [ ! -f "$$GOBIN/golangci-lint" ] || ! "$$GOBIN/golangci-lint" version 2>/dev/null | grep -q -F "$$CLEAN_VER"; then \
+		echo "Installing pinned golangci-lint @$(GOLANGCI_LINT_VERSION) to $$GOBIN..."; \
+		go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION); \
 	fi; \
 	if [ -f "$$GOBIN/golangci-lint" ]; then \
 		"$$GOBIN/golangci-lint" run; \
@@ -75,11 +79,13 @@ vuln:
 	@GOBIN=$$(go env GOBIN); \
 	GOPATH=$$(go env GOPATH); \
 	if [ -z "$$GOBIN" ]; then GOBIN=$$GOPATH/bin; fi; \
-	if [ ! -f "$$GOBIN/govulncheck" ]; then \
-		echo "Installing govulncheck..."; \
-		go install golang.org/x/vuln/cmd/govulncheck@v1.1.4; \
+	TARGET_VER="$(GOVULNCHECK_VERSION)"; \
+	CLEAN_VER=$${TARGET_VER#v}; \
+	if [ ! -f "$$GOBIN/govulncheck" ] || ! "$$GOBIN/govulncheck" -version 2>/dev/null | grep -q -F "$$CLEAN_VER"; then \
+		echo "Installing govulncheck @$(GOVULNCHECK_VERSION)..."; \
+		go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION); \
 	fi; \
-	$$GOBIN/govulncheck ./...
+	"$$GOBIN/govulncheck" ./...
 
 ## Format all Go source files
 fmt:

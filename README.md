@@ -53,7 +53,7 @@ A production-grade, idiomatic Go implementation addressing all three questions o
 
 | Component | Tool / Library / Framework | Rationale |
 |---|---|---|
-| **Language & Runtime** | Go 1.26+ | Modern, high-performance concurrency with standard library HTTP routing and structured logging. Requires Go 1.26+ toolchain. |
+| **Language & Runtime** | Go 1.26.6+ | Modern, high-performance concurrency with standard library HTTP routing and structured logging. Requires Go 1.26.6+ toolchain. |
 | **SQLite Driver** | `modernc.org/sqlite` | Pure-Go SQLite implementation. Zero CGO dependencies, enabling fast, isolated, cross-platform in-memory testing. |
 | **Postgres / Cockroach Driver** | `github.com/lib/pq` | Battle-tested PostgreSQL driver compatible with both PostgreSQL and CockroachDB wire protocols. |
 | **Concurrency & Synchronization** | `golang.org/x/sync/singleflight` | Prevents duplicate upstream authentications during cache stampedes. |

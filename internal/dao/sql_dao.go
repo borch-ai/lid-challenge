@@ -32,6 +32,12 @@ func init() {
 			return strings.ToLower(fmt.Sprint(v)), nil
 		}
 	})
+
+	// Ensure PRAGMA foreign_keys = ON is executed on every acquired SQLite connection
+	sqlite.RegisterConnectionHook(func(conn sqlite.ExecQuerierContext, _ string) error {
+		_, err := conn.ExecContext(context.Background(), "PRAGMA foreign_keys = ON;", nil)
+		return err
+	})
 }
 
 const maxTxRetries = 3
@@ -88,7 +94,13 @@ func NewSQLDAO(db *sql.DB, dialect Dialect) *SQLDAO {
 // NewSQLiteDAO connects to a SQLite database and initializes the DAO.
 func NewSQLiteDAO(dsn string) (*SQLDAO, error) {
 	if dsn == "" {
-		dsn = fmt.Sprintf("file:mem_%s?mode=memory&cache=shared", uuid.New().String())
+		dsn = fmt.Sprintf("file:mem_%s?mode=memory&cache=shared&_pragma=foreign_keys(1)", uuid.New().String())
+	} else if !strings.Contains(dsn, "foreign_keys") {
+		separator := "?"
+		if strings.Contains(dsn, "?") {
+			separator = "&"
+		}
+		dsn = fmt.Sprintf("%s%s_pragma=foreign_keys(1)", dsn, separator)
 	}
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {

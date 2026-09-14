@@ -180,4 +180,14 @@ func TestUserToken(t *testing.T) {
 	if _, err := GenerateUserToken(userID, username, "", time.Hour); err == nil {
 		t.Error("expected error generating token with empty secret, got nil")
 	}
+
+	// 7. Oversized token / signature rejection
+	oversizedToken := strings.Repeat("a", 4097)
+	if _, err := VerifyUserToken(oversizedToken, secret); !errors.Is(err, ErrInvalidToken) {
+		t.Errorf("expected ErrInvalidToken for oversized token, got: %v", err)
+	}
+	oversizedSig := "validpayload." + strings.Repeat("s", 129)
+	if _, err := VerifyUserToken(oversizedSig, secret); !errors.Is(err, ErrInvalidToken) {
+		t.Errorf("expected ErrInvalidToken for oversized signature, got: %v", err)
+	}
 }

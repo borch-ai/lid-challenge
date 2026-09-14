@@ -49,14 +49,14 @@ if [ "$USE_EXISTING_SERVER" = "true" ]; then
     echo "To run tests against an existing server, explicitly set ALLOW_MUTATING_TESTS=true."
     exit 1
   fi
-  if ! curl -s -f "$BASE_URL/api/v1/health" >/dev/null 2>&1; then
+  if ! curl -s --connect-timeout 2 --max-time 5 -f "$BASE_URL/api/v1/health" >/dev/null 2>&1; then
     echo "Error: USE_EXISTING_SERVER=true specified, but no server is reachable at $BASE_URL."
     exit 1
   fi
   echo "Targeting existing server at $BASE_URL (opt-in mode, ALLOW_MUTATING_TESTS=true)."
 else
   echo "Starting isolated test server on port $TEST_PORT..."
-  if curl -s -f "$BASE_URL/api/v1/health" >/dev/null 2>&1; then
+  if curl -s --connect-timeout 2 --max-time 5 -f "$BASE_URL/api/v1/health" >/dev/null 2>&1; then
     echo "Error: Port $TEST_PORT is already occupied by a running service at $BASE_URL. Please set TEST_PORT to an unused port or terminate the existing process."
     exit 1
   fi
@@ -89,7 +89,7 @@ else
       echo "Error: Isolated server process (PID $SERVER_PID) terminated unexpectedly during startup."
       exit 1
     fi
-    if curl -s -f "$BASE_URL/api/v1/health" >/dev/null 2>&1; then
+    if curl -s --connect-timeout 2 --max-time 5 -f "$BASE_URL/api/v1/health" >/dev/null 2>&1; then
       READY=1
       echo "Server is healthy and ready (attempt $attempt)!"
       break
@@ -104,7 +104,7 @@ fi
 
 # 1. Health Check
 echo -n "1. Testing Health Check... "
-HEALTH_RESP=$(curl -s -w "\n%{http_code}" "$BASE_URL/api/v1/health")
+HEALTH_RESP=$(curl -s --connect-timeout 2 --max-time 10 -w "\n%{http_code}" "$BASE_URL/api/v1/health")
 HTTP_CODE=$(echo "$HEALTH_RESP" | tail -n1)
 BODY=$(echo "$HEALTH_RESP" | sed '$d')
 if [ "$HTTP_CODE" -ne 200 ]; then
@@ -115,7 +115,7 @@ echo "PASS (HTTP 200) -> $BODY"
 
 # 1b. Readiness Probe (Database connectivity verification)
 echo -n "1b. Testing Readiness Probe (DB Ping)... "
-READY_RESP=$(curl -s -w "\n%{http_code}" "$BASE_URL/api/v1/ready")
+READY_RESP=$(curl -s --connect-timeout 2 --max-time 10 -w "\n%{http_code}" "$BASE_URL/api/v1/ready")
 HTTP_CODE=$(echo "$READY_RESP" | tail -n1)
 BODY=$(echo "$READY_RESP" | sed '$d')
 if [ "$HTTP_CODE" -ne 200 ]; then
@@ -130,7 +130,7 @@ echo "PASS (HTTP 200) -> $BODY"
 
 # 1c. OpenAPI Specification Endpoint
 echo -n "1c. Testing OpenAPI Spec (GET /api/v1/openapi.yaml)... "
-OPENAPI_RESP=$(curl -s -w "\n%{http_code}" "$BASE_URL/api/v1/openapi.yaml")
+OPENAPI_RESP=$(curl -s --connect-timeout 2 --max-time 10 -w "\n%{http_code}" "$BASE_URL/api/v1/openapi.yaml")
 HTTP_CODE=$(echo "$OPENAPI_RESP" | tail -n1)
 BODY=$(echo "$OPENAPI_RESP" | sed '$d')
 if [ "$HTTP_CODE" -ne 200 ]; then
@@ -160,7 +160,7 @@ CREATE_PAYLOAD="{
   \"username\": \"$ALICE_USER\",
   \"password\": \"Password123!\"
 }"
-CREATE_RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/api/v1/users" \
+CREATE_RESP=$(curl -s --connect-timeout 2 --max-time 10 -w "\n%{http_code}" -X POST "$BASE_URL/api/v1/users" \
   -H "Content-Type: application/json" \
   -d "$CREATE_PAYLOAD")
 HTTP_CODE=$(echo "$CREATE_RESP" | tail -n1)
@@ -174,7 +174,7 @@ echo "PASS (HTTP 201) -> Created User ID: $ALICE_ID"
 
 # 3. Conflict Check (Duplicate Username)
 echo -n "3. Testing Duplicate User Conflict... "
-DUP_RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/api/v1/users" \
+DUP_RESP=$(curl -s --connect-timeout 2 --max-time 10 -w "\n%{http_code}" -X POST "$BASE_URL/api/v1/users" \
   -H "Content-Type: application/json" \
   -d "$CREATE_PAYLOAD")
 HTTP_CODE=$(echo "$DUP_RESP" | tail -n1)
@@ -202,7 +202,7 @@ BOB_PAYLOAD="{
   \"username\": \"$BOB_USER\",
   \"password\": \"CanWeFixIt123!\"
 }"
-BOB_RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/api/v1/users" \
+BOB_RESP=$(curl -s --connect-timeout 2 --max-time 10 -w "\n%{http_code}" -X POST "$BASE_URL/api/v1/users" \
   -H "Content-Type: application/json" \
   -d "$BOB_PAYLOAD")
 HTTP_CODE=$(echo "$BOB_RESP" | tail -n1)
@@ -215,7 +215,7 @@ echo "PASS (HTTP 201) -> Created User ID: $BOB_ID"
 
 # 5. Authenticate / Login
 echo -n "5. Testing Valid Authentication... "
-LOGIN_RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/api/v1/auth/login" \
+LOGIN_RESP=$(curl -s --connect-timeout 2 --max-time 10 -w "\n%{http_code}" -X POST "$BASE_URL/api/v1/auth/login" \
   -H "Content-Type: application/json" \
   -d "{\"username\": \"$ALICE_USER\", \"password\": \"Password123!\"}")
 HTTP_CODE=$(echo "$LOGIN_RESP" | tail -n1)
@@ -232,7 +232,7 @@ fi
 echo "PASS (HTTP 200) -> Acquired User Token"
 
 echo -n "6. Testing Invalid Authentication... "
-BAD_LOGIN_RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/api/v1/auth/login" \
+BAD_LOGIN_RESP=$(curl -s --connect-timeout 2 --max-time 10 -w "\n%{http_code}" -X POST "$BASE_URL/api/v1/auth/login" \
   -H "Content-Type: application/json" \
   -d "{\"username\": \"$ALICE_USER\", \"password\": \"WrongPassword!\"}")
 HTTP_CODE=$(echo "$BAD_LOGIN_RESP" | tail -n1)
@@ -244,7 +244,7 @@ echo "PASS (HTTP 401 properly rejected)"
 
 # 7. Security: Unauthenticated profile access
 echo -n "7. Testing Unauthorized Profile Access... "
-NO_AUTH_RESP=$(curl -s -w "\n%{http_code}" "$BASE_URL/api/v1/profiles/$ALICE_ID")
+NO_AUTH_RESP=$(curl -s --connect-timeout 2 --max-time 10 -w "\n%{http_code}" "$BASE_URL/api/v1/profiles/$ALICE_ID")
 HTTP_CODE=$(echo "$NO_AUTH_RESP" | tail -n1)
 if [ "$HTTP_CODE" -ne 401 ]; then
   echo "FAIL: Expected 401 Unauthorized, got $HTTP_CODE"
@@ -255,7 +255,7 @@ echo "PASS (HTTP 401 missing token rejected)"
 # 8. Security: Invalid Bearer token
 echo -n "8. Testing Invalid Bearer Token... "
 INVALID_TOKEN="invalid_sample_token"
-BAD_TOKEN_RESP=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $INVALID_TOKEN" "$BASE_URL/api/v1/profiles/$ALICE_ID")
+BAD_TOKEN_RESP=$(curl -s --connect-timeout 2 --max-time 10 -w "\n%{http_code}" -H "Authorization: Bearer $INVALID_TOKEN" "$BASE_URL/api/v1/profiles/$ALICE_ID")
 HTTP_CODE=$(echo "$BAD_TOKEN_RESP" | tail -n1)
 if [ "$HTTP_CODE" -ne 401 ]; then
   echo "FAIL: Expected 401 Unauthorized, got $HTTP_CODE"
@@ -265,7 +265,7 @@ echo "PASS (HTTP 401 invalid token rejected)"
 
 # 9. Authenticated Profile Retrieval (Using User's Issued Token)
 echo -n "9. Testing Authenticated Profile Retrieval (User Token)... "
-GET_RESP=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $ALICE_TOKEN" "$BASE_URL/api/v1/profiles/$ALICE_ID")
+GET_RESP=$(curl -s --connect-timeout 2 --max-time 10 -w "\n%{http_code}" -H "Authorization: Bearer $ALICE_TOKEN" "$BASE_URL/api/v1/profiles/$ALICE_ID")
 HTTP_CODE=$(echo "$GET_RESP" | tail -n1)
 BODY=$(echo "$GET_RESP" | sed '$d')
 if [ "$HTTP_CODE" -ne 200 ]; then
@@ -280,7 +280,7 @@ echo "PASS (HTTP 200) -> Retrieved profile for $ALICE_NAME using signed user tok
 
 # 9b. Authenticated Profile Retrieval (Using Master Service AuthSecret)
 echo -n "9b. Testing Authenticated Profile Retrieval (Master Secret)... "
-GET_MASTER_RESP=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $AUTH_SECRET" "$BASE_URL/api/v1/profiles/$ALICE_ID")
+GET_MASTER_RESP=$(curl -s --connect-timeout 2 --max-time 10 -w "\n%{http_code}" -H "Authorization: Bearer $AUTH_SECRET" "$BASE_URL/api/v1/profiles/$ALICE_ID")
 HTTP_CODE=$(echo "$GET_MASTER_RESP" | tail -n1)
 if [ "$HTTP_CODE" -ne 200 ]; then
   echo "FAIL (HTTP $HTTP_CODE)"
@@ -290,7 +290,7 @@ echo "PASS (HTTP 200) -> Master service secret verified"
 
 # 9c. Security: User token forbidden on cross-user profile retrieval
 echo -n "9c. Testing User Token Forbidden on Cross-User Profile... "
-FORBIDDEN_PROFILE_RESP=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $ALICE_TOKEN" "$BASE_URL/api/v1/profiles/$BOB_ID")
+FORBIDDEN_PROFILE_RESP=$(curl -s --connect-timeout 2 --max-time 10 -w "\n%{http_code}" -H "Authorization: Bearer $ALICE_TOKEN" "$BASE_URL/api/v1/profiles/$BOB_ID")
 HTTP_CODE=$(echo "$FORBIDDEN_PROFILE_RESP" | tail -n1)
 if [ "$HTTP_CODE" -ne 403 ]; then
   echo "FAIL: Expected 403 Forbidden for cross-user profile retrieval, got $HTTP_CODE"
@@ -300,7 +300,7 @@ echo "PASS (HTTP 403 properly rejected)"
 
 # 9d. Security: User token forbidden on directory search
 echo -n "9d. Testing User Token Forbidden on Directory Search... "
-FORBIDDEN_SEARCH_RESP=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $ALICE_TOKEN" "$BASE_URL/api/v1/profiles?name=$BOB_NAME")
+FORBIDDEN_SEARCH_RESP=$(curl -s --connect-timeout 2 --max-time 10 -w "\n%{http_code}" -H "Authorization: Bearer $ALICE_TOKEN" "$BASE_URL/api/v1/profiles?name=$BOB_NAME")
 HTTP_CODE=$(echo "$FORBIDDEN_SEARCH_RESP" | tail -n1)
 if [ "$HTTP_CODE" -ne 403 ]; then
   echo "FAIL: Expected 403 Forbidden for user token search, got $HTTP_CODE"
@@ -310,7 +310,7 @@ echo "PASS (HTTP 403 properly rejected)"
 
 # 10. Profile Search by Name (Administrative)
 echo -n "10. Testing Profile Search by Name ($ALICE_NAME)... "
-SEARCH_NAME_RESP=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $AUTH_SECRET" "$BASE_URL/api/v1/profiles?name=$ALICE_NAME")
+SEARCH_NAME_RESP=$(curl -s --connect-timeout 2 --max-time 10 -w "\n%{http_code}" -H "Authorization: Bearer $AUTH_SECRET" "$BASE_URL/api/v1/profiles?name=$ALICE_NAME")
 HTTP_CODE=$(echo "$SEARCH_NAME_RESP" | tail -n1)
 BODY=$(echo "$SEARCH_NAME_RESP" | sed '$d')
 if [ "$HTTP_CODE" -ne 200 ]; then
@@ -326,7 +326,7 @@ echo "PASS (HTTP 200) -> Matched 1 record"
 
 # 11. Profile Search by Locality (Administrative)
 echo -n "11. Testing Profile Search by Locality ($BOB_LOC)... "
-SEARCH_LOC_RESP=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $AUTH_SECRET" "$BASE_URL/api/v1/profiles?locality=$BOB_LOC")
+SEARCH_LOC_RESP=$(curl -s --connect-timeout 2 --max-time 10 -w "\n%{http_code}" -H "Authorization: Bearer $AUTH_SECRET" "$BASE_URL/api/v1/profiles?locality=$BOB_LOC")
 HTTP_CODE=$(echo "$SEARCH_LOC_RESP" | tail -n1)
 BODY=$(echo "$SEARCH_LOC_RESP" | sed '$d')
 COUNT=$(echo "$BODY" | grep -o '"count":[0-9]*' | cut -d: -f2)
@@ -338,7 +338,7 @@ echo "PASS (HTTP 200) -> Matched $BOB_NAME in $BOB_LOC"
 
 # 12. Search Pagination (Administrative)
 echo -n "12. Testing Pagination (limit=1, offset=0)... "
-PAGE_RESP=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $AUTH_SECRET" "$BASE_URL/api/v1/profiles?limit=1&offset=0")
+PAGE_RESP=$(curl -s --connect-timeout 2 --max-time 10 -w "\n%{http_code}" -H "Authorization: Bearer $AUTH_SECRET" "$BASE_URL/api/v1/profiles?limit=1&offset=0")
 HTTP_CODE=$(echo "$PAGE_RESP" | tail -n1)
 BODY=$(echo "$PAGE_RESP" | sed '$d')
 COUNT=$(echo "$BODY" | grep -o '"count":[0-9]*' | cut -d: -f2)

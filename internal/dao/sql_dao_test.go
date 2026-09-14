@@ -509,13 +509,40 @@ func TestSQLDAO_CreateUser_ContextCanceled(t *testing.T) {
 
 func TestSQLiteDAO_ForeignKeysEnabled(t *testing.T) {
 	dao := setupTestDAO(t)
+	ctx := context.Background()
+
+	// 1. Initial pool query has foreign keys enabled
 	var fkEnabled int
-	err := dao.db.QueryRowContext(context.Background(), "PRAGMA foreign_keys;").Scan(&fkEnabled)
+	err := dao.db.QueryRowContext(ctx, "PRAGMA foreign_keys;").Scan(&fkEnabled)
 	if err != nil {
 		t.Fatalf("failed to query foreign_keys pragma: %v", err)
 	}
 	if fkEnabled != 1 {
 		t.Fatalf("expected foreign_keys pragma to be 1, got %d", fkEnabled)
+	}
+
+	// 2. Acquired dedicated connection also has foreign keys enabled via connection hook
+	conn, err := dao.db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("failed to acquire dedicated connection: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	var fkConn int
+	if err := conn.QueryRowContext(ctx, "PRAGMA foreign_keys;").Scan(&fkConn); err != nil {
+		t.Fatalf("failed to query foreign_keys pragma on dedicated connection: %v", err)
+	}
+	if fkConn != 1 {
+		t.Fatalf("expected foreign_keys pragma on dedicated connection to be 1, got %d", fkConn)
+	}
+
+	// 3. Orphaned credential insertion must fail foreign key constraint
+	orphanQuery := dao.dialect.Rebind(`
+		INSERT INTO user_credential (user_id, username, method, password_hash, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`)
+	_, err = conn.ExecContext(ctx, orphanQuery, "nonexistent-user-id", "orphan", "bcrypt", "hash", time.Now(), time.Now())
+	if err == nil {
+		t.Fatal("expected foreign key constraint violation inserting orphaned credential, got nil")
 	}
 }
 

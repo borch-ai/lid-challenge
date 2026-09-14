@@ -60,12 +60,22 @@ func VerifyUserToken(tokenStr, secret string) (*TokenClaims, error) {
 		return nil, ErrInvalidToken
 	}
 
+	// Limit token and signature sizes to prevent allocation / computation abuse from oversized bearer tokens
+	const maxTokenLen = 4096
+	const maxSigLen = 128
+	if len(tokenStr) > maxTokenLen {
+		return nil, ErrInvalidToken
+	}
+
 	parts := strings.Split(tokenStr, ".")
 	if len(parts) != 2 {
 		return nil, ErrInvalidToken
 	}
 
 	payloadPart, sigPart := parts[0], parts[1]
+	if len(sigPart) > maxSigLen || len(sigPart) == 0 || len(payloadPart) == 0 {
+		return nil, ErrInvalidToken
+	}
 
 	// Compute expected HMAC
 	mac := hmac.New(sha256.New, []byte(secret))

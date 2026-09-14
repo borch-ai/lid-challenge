@@ -1,0 +1,14 @@
+name: PR Title
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  statuses: write
+  pull-requests: read
+
+jobs:
+  check:
+    uses: borch-ai/.github/.github/workflows/pr-title.yml@d681ba06277e712137904d2254f98a138e50e4fe
+    secrets: inherit

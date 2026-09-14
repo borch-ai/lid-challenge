@@ -1,0 +1,81 @@
+name: System Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  system-tests:
+    name: Live Integration & System Tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: lid_user
+          POSTGRES_PASSWORD: lid_password
+          POSTGRES_DB: lid_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.3.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build Service Binary
+        run: make build
+
+      - name: Run System Tests (SQLite)
+        run: ./scripts/system_test.sh
+
+      - name: Run System Tests (PostgreSQL)
+        env:
+          ALLOW_MUTATING_TESTS: "true"
+          DB_DRIVER: postgres
+          DB_DSN: "postgres://lid_user:lid_password@localhost:5432/lid_db?sslmode=disable"
+        run: ./scripts/system_test.sh
+
+      - name: Start CockroachDB
+        run: |
+          docker run -d --name cockroach -p 26257:26257 cockroachdb/cockroach:v24.3.0 start-single-node --insecure
+          READY=0
+          for attempt in $(seq 1 30); do
+            if docker exec cockroach ./cockroach node status --insecure >/dev/null 2>&1; then
+              echo "CockroachDB is ready (attempt $attempt)!"
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$READY" -ne 1 ]; then
+            echo "Error: CockroachDB failed to become ready within 30 seconds"
+            exit 1
+          fi
+
+      - name: Run System Tests (CockroachDB)
+        env:
+          ALLOW_MUTATING_TESTS: "true"
+          DB_DRIVER: cockroach
+          DB_DSN: "postgres://root@localhost:26257/defaultdb?sslmode=disable"
+        run: ./scripts/system_test.sh
+
+      - name: Run 3rd-Party Vendor Connector Live Tests
+        run: go run ./scripts/test_connector_live.go

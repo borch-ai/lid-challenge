@@ -3,6 +3,7 @@ package dao
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -246,6 +247,67 @@ func TestMigrator_ErrorCases_Validation(t *testing.T) {
 		t.Errorf("expected error for zero migration version, got nil")
 	} else if !strings.Contains(err.Error(), "version must be positive") {
 		t.Errorf("expected error to contain 'version must be positive', got %v", err)
+	}
+
+	// 11. Duplicate up migration file for same version
+	duplicateUpFS := fstest.MapFS{
+		"migrations/000001_first.up.sql":   &fstest.MapFile{Data: []byte("CREATE TABLE a(id INT);")},
+		"migrations/000001_first.down.sql": &fstest.MapFile{Data: []byte("DROP TABLE a;")},
+		"migrations/1_first.up.sql":        &fstest.MapFile{Data: []byte("CREATE TABLE b(id INT);")},
+	}
+	if _, err := LoadMigrations(duplicateUpFS, "migrations"); err == nil {
+		t.Errorf("expected error for duplicate up migration, got nil")
+	} else if !strings.Contains(err.Error(), "duplicate up migration") {
+		t.Errorf("expected error to contain 'duplicate up migration', got %v", err)
+	}
+
+	// 12. Duplicate down migration file for same version
+	duplicateDownFS := fstest.MapFS{
+		"migrations/000001_first.up.sql":   &fstest.MapFile{Data: []byte("CREATE TABLE a(id INT);")},
+		"migrations/000001_first.down.sql": &fstest.MapFile{Data: []byte("DROP TABLE a;")},
+		"migrations/1_first.down.sql":      &fstest.MapFile{Data: []byte("DROP TABLE b;")},
+	}
+	if _, err := LoadMigrations(duplicateDownFS, "migrations"); err == nil {
+		t.Errorf("expected error for duplicate down migration, got nil")
+	} else if !strings.Contains(err.Error(), "duplicate down migration") {
+		t.Errorf("expected error to contain 'duplicate down migration', got %v", err)
+	}
+
+	// 13. Subdirectory inside migrations directory is skipped
+	subdirFS := fstest.MapFS{
+		"migrations/subdir":               &fstest.MapFile{Mode: os.ModeDir},
+		"migrations/000001_init.up.sql":   &fstest.MapFile{Data: []byte("CREATE TABLE foo(id INT);")},
+		"migrations/000001_init.down.sql": &fstest.MapFile{Data: []byte("DROP TABLE foo;")},
+	}
+	migsWithSubdir, err := LoadMigrations(subdirFS, "migrations")
+	if err != nil || len(migsWithSubdir) != 1 {
+		t.Errorf("expected subdir to be skipped and 1 migration loaded, got %d (err: %v)", len(migsWithSubdir), err)
+	}
+
+	// 14. Malformed filenames with missing version or name parts
+	missingPrefixFS := fstest.MapFS{
+		"migrations/_init.up.sql": &fstest.MapFile{Data: []byte("SELECT 1;")},
+	}
+	if _, err := LoadMigrations(missingPrefixFS, "migrations"); err == nil {
+		t.Errorf("expected error for missing version prefix, got nil")
+	}
+
+	missingSuffixFS := fstest.MapFS{
+		"migrations/000001_.up.sql": &fstest.MapFile{Data: []byte("SELECT 1;")},
+	}
+	if _, err := LoadMigrations(missingSuffixFS, "migrations"); err == nil {
+		t.Errorf("expected error for missing name suffix, got nil")
+	}
+
+	// Test parseMigrationTime error cases
+	if _, err := parseMigrationTime("not-a-timestamp"); err == nil {
+		t.Errorf("expected error parsing invalid time string")
+	}
+	if _, err := parseMigrationTime([]byte("not-a-timestamp")); err == nil {
+		t.Errorf("expected error parsing invalid time byte slice")
+	}
+	if _, err := parseMigrationTime(12345); err == nil {
+		t.Errorf("expected error parsing unsupported type")
 	}
 }
 
@@ -582,7 +644,7 @@ func TestMigrator_Lock_And_BreakStaleLock(t *testing.T) {
 	// Lock the table so acquireLock cannot immediately grab it
 	_, _ = db.ExecContext(ctx, "UPDATE schema_migrations_lock SET is_locked = 1, locked_at = ?, locked_by = 'holder' WHERE id = 1", time.Now().UTC().Format(time.RFC3339Nano))
 
-	if _, err := m.acquireLock(canceledCtx); err == nil {
+	if _, _, err := m.acquireLock(canceledCtx); err == nil {
 		t.Errorf("expected acquireLock to fail with canceled context, got nil")
 	}
 
@@ -608,7 +670,7 @@ func TestMigrator_Lock_And_BreakStaleLock(t *testing.T) {
 	}
 
 	// 4. Test acquireLock and unlock function lifecycle
-	unlock, err := m.acquireLock(ctx)
+	_, unlock, err := m.acquireLock(ctx)
 	if err != nil {
 		t.Fatalf("failed to acquire lock: %v", err)
 	}
@@ -618,11 +680,11 @@ func TestMigrator_Lock_And_BreakStaleLock(t *testing.T) {
 	}
 
 	// renewLock test
-	if err := m.renewLock(ctx, "nonexistent"); err != nil {
-		t.Errorf("renewLock failed: %v", err)
+	if err := m.renewLock(ctx, "nonexistent"); !errors.Is(err, errLockLost) {
+		t.Errorf("expected renewLock with nonexistent owner to return errLockLost, got: %v", err)
 	}
-	if err := pgM.renewLock(ctx, "nonexistent"); err != nil {
-		t.Errorf("pgM.renewLock failed: %v", err)
+	if err := pgM.renewLock(ctx, "nonexistent"); !errors.Is(err, errLockLost) {
+		t.Errorf("expected pgM.renewLock with nonexistent owner to return errLockLost, got: %v", err)
 	}
 
 	// Unlock successfully
@@ -762,4 +824,79 @@ func TestMigrator_SQLite_ProcessLiveness_Lock(t *testing.T) {
 	if isLocked {
 		t.Errorf("expected lock to be broken for dead local process, but it remained locked")
 	}
+}
+
+func TestMigrator_Validation_Branches(t *testing.T) {
+	if _, err := NewMigrator(nil, SQLiteDialect{}); err == nil {
+		t.Errorf("expected error for nil db")
+	}
+	db, _ := sql.Open("sqlite", "file::memory:?cache=shared")
+	defer func() { _ = db.Close() }()
+	if _, err := NewMigrator(db, nil); err == nil {
+		t.Errorf("expected error for nil dialect")
+	}
+	if _, err := NewMigrator(db, unsupportedDialect{}); err == nil {
+		t.Errorf("expected error for unsupported dialect")
+	}
+
+	// Test EnsureTable, Version, Status, getAppliedMigrations with closed db
+	closedDB, _ := sql.Open("sqlite", "file::memory:?cache=shared")
+	_ = closedDB.Close()
+	mClosed := &Migrator{db: closedDB, dialect: SQLiteDialect{}}
+	if err := mClosed.EnsureTable(context.Background()); err == nil {
+		t.Errorf("expected EnsureTable to fail on closed db")
+	}
+	if _, err := mClosed.Version(context.Background()); err == nil {
+		t.Errorf("expected Version to fail on closed db")
+	}
+	if _, err := mClosed.Status(context.Background()); err == nil {
+		t.Errorf("expected Status to fail on closed db")
+	}
+	if _, err := mClosed.getAppliedMigrations(context.Background()); err == nil {
+		t.Errorf("expected getAppliedMigrations to fail on closed db")
+	}
+}
+
+func TestMigrator_LockLost_FencesMigration(t *testing.T) {
+	db, err := sql.Open("sqlite", "file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("failed to open sqlite database: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	ctx := context.Background()
+	m, err := NewMigrator(db, SQLiteDialect{})
+	if err != nil {
+		t.Fatalf("failed to create migrator: %v", err)
+	}
+	if err := m.EnsureTable(ctx); err != nil {
+		t.Fatalf("failed to ensure table: %v", err)
+	}
+
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+
+	// applyMigration and rollbackMigration with canceled context
+	if err := m.applyMigration(canceledCtx, m.migrations[0]); err == nil {
+		t.Errorf("expected applyMigration to fail with canceled context")
+	}
+	if err := m.rollbackMigration(canceledCtx, m.migrations[0]); err == nil {
+		t.Errorf("expected rollbackMigration to fail with canceled context")
+	}
+
+	// acquireLock with PostgresDialect renewal
+	pgM := &Migrator{db: db, dialect: PostgresDialect{}, migrations: m.migrations}
+	migrationCtx, unlock, err := pgM.acquireLock(ctx)
+	if err != nil {
+		t.Fatalf("failed to acquire pg lock: %v", err)
+	}
+	defer unlock()
+
+	// Steal lock by overwriting locked_by in DB
+	_, _ = db.ExecContext(ctx, "UPDATE schema_migrations_lock SET locked_by = 'thief' WHERE id = 1")
+	// renewLock must fail with errLockLost
+	if err := pgM.renewLock(ctx, "someone"); !errors.Is(err, errLockLost) {
+		t.Errorf("expected errLockLost, got: %v", err)
+	}
+	_ = migrationCtx
 }

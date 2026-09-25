@@ -111,8 +111,14 @@ func LoadMigrations(fsys fs.FS, dir string) ([]Migration, error) {
 		}
 
 		if direction == "up" {
+			if mig.UpSQL != "" {
+				return nil, fmt.Errorf("duplicate up migration for version %d (found in %q)", version, name)
+			}
 			mig.UpSQL = content
 		} else {
+			if mig.DownSQL != "" {
+				return nil, fmt.Errorf("duplicate down migration for version %d (found in %q)", version, name)
+			}
 			mig.DownSQL = content
 		}
 	}
@@ -223,10 +229,13 @@ const (
 	staleLockTimeout      = 1 * time.Minute
 )
 
+var errLockLost = errors.New("migration lock lease lost: lock is no longer owned by this process")
+
 // acquireLock acquires an exclusive distributed lock on schema_migrations_lock, retrying until ctx expires.
-// On success, it launches a background heartbeat goroutine to continuously renew the lock lease,
-// and returns an unlock function that stops the heartbeat and releases the lock with ownership fencing.
-func (m *Migrator) acquireLock(ctx context.Context) (func(), error) {
+// On success, it launches a background heartbeat goroutine to continuously renew the lock lease.
+// It returns a fenced migration context (canceled if lock ownership is lost or heartbeat expires),
+// an unlock function that stops the heartbeat and releases the lock with ownership fencing, and an error.
+func (m *Migrator) acquireLock(ctx context.Context) (context.Context, func(), error) {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
 	hostname, _ := os.Hostname()
@@ -243,7 +252,7 @@ func (m *Migrator) acquireLock(ctx context.Context) (func(), error) {
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("timeout or canceled while waiting for migration lock: %w", ctx.Err())
+			return nil, nil, fmt.Errorf("timeout or canceled while waiting for migration lock: %w", ctx.Err())
 		default:
 		}
 
@@ -257,6 +266,7 @@ func (m *Migrator) acquireLock(ctx context.Context) (func(), error) {
 		if err == nil {
 			rows, _ := res.RowsAffected()
 			if rows == 1 {
+				migrationCtx, cancelMigration := context.WithCancel(ctx)
 				heartbeatCtx, cancelHeartbeat := context.WithCancel(context.Background())
 				var wg sync.WaitGroup
 				wg.Add(1)
@@ -264,14 +274,24 @@ func (m *Migrator) acquireLock(ctx context.Context) (func(), error) {
 					defer wg.Done()
 					hbTicker := time.NewTicker(lockHeartbeatInterval)
 					defer hbTicker.Stop()
+					lastRenewed := time.Now().UTC()
 					for {
 						select {
 						case <-heartbeatCtx.Done():
 							return
 						case <-hbTicker.C:
-							renewCtx, renewCancel := context.WithTimeout(heartbeatCtx, 1*time.Second)
-							_ = m.renewLock(renewCtx, lockOwner)
+							renewCtx, renewCancel := context.WithTimeout(heartbeatCtx, 2*time.Second)
+							err := m.renewLock(renewCtx, lockOwner)
 							renewCancel()
+							if err == nil {
+								lastRenewed = time.Now().UTC()
+							} else if errors.Is(err, errLockLost) {
+								cancelMigration()
+								return
+							} else if m.dialect.Name() != "sqlite" && time.Since(lastRenewed) >= staleLockTimeout {
+								cancelMigration()
+								return
+							}
 						}
 					}
 				}()
@@ -286,7 +306,7 @@ func (m *Migrator) acquireLock(ctx context.Context) (func(), error) {
 						_ = m.releaseLock(relCtx, lockOwner)
 					})
 				}
-				return unlock, nil
+				return migrationCtx, unlock, nil
 			}
 		}
 
@@ -295,7 +315,7 @@ func (m *Migrator) acquireLock(ctx context.Context) (func(), error) {
 
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("timeout or canceled while waiting for migration lock: %w", ctx.Err())
+			return nil, nil, fmt.Errorf("timeout or canceled while waiting for migration lock: %w", ctx.Err())
 		case <-ticker.C:
 		}
 	}
@@ -313,8 +333,18 @@ func (m *Migrator) renewLock(ctx context.Context, lockOwner string) error {
 		SET locked_at = ?
 		WHERE id = 1 AND is_locked = TRUE AND locked_by = ?
 	`)
-	_, err := m.db.ExecContext(ctx, query, nowParam, lockOwner)
-	return err
+	res, err := m.db.ExecContext(ctx, query, nowParam, lockOwner)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return errLockLost
+	}
+	return nil
 }
 
 // releaseLock releases the exclusive distributed lock on schema_migrations_lock,
@@ -445,13 +475,13 @@ func (m *Migrator) Up(ctx context.Context) (int, error) {
 		return 0, err
 	}
 
-	unlock, err := m.acquireLock(ctx)
+	migrationCtx, unlock, err := m.acquireLock(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("failed to acquire migration lock: %w", err)
 	}
 	defer unlock()
 
-	applied, err := m.getAppliedMigrations(ctx)
+	applied, err := m.getAppliedMigrations(migrationCtx)
 	if err != nil {
 		return 0, err
 	}
@@ -465,7 +495,10 @@ func (m *Migrator) Up(ctx context.Context) (int, error) {
 			continue
 		}
 
-		if err := m.applyMigration(ctx, mig); err != nil {
+		if err := m.applyMigration(migrationCtx, mig); err != nil {
+			if migrationCtx.Err() != nil {
+				return count, fmt.Errorf("migration aborted: lock lease lost: %w", migrationCtx.Err())
+			}
 			return count, err
 		}
 		count++
@@ -480,13 +513,13 @@ func (m *Migrator) Down(ctx context.Context, steps int) (int, error) {
 		return 0, err
 	}
 
-	unlock, err := m.acquireLock(ctx)
+	migrationCtx, unlock, err := m.acquireLock(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("failed to acquire migration lock: %w", err)
 	}
 	defer unlock()
 
-	applied, err := m.getAppliedMigrations(ctx)
+	applied, err := m.getAppliedMigrations(migrationCtx)
 	if err != nil {
 		return 0, err
 	}
@@ -515,7 +548,10 @@ func (m *Migrator) Down(ctx context.Context, steps int) (int, error) {
 		if count >= steps {
 			break
 		}
-		if err := m.rollbackMigration(ctx, mig); err != nil {
+		if err := m.rollbackMigration(migrationCtx, mig); err != nil {
+			if migrationCtx.Err() != nil {
+				return count, fmt.Errorf("rollback aborted: lock lease lost: %w", migrationCtx.Err())
+			}
 			return count, err
 		}
 		count++

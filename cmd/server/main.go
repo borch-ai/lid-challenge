@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -18,7 +19,47 @@ import (
 	"github.com/borch-ai/lid-challenge/internal/dao"
 )
 
+func initUserDAO(driver, dsn string) (dao.UserDAO, error) {
+	switch strings.ToLower(strings.TrimSpace(driver)) {
+	case "sqlite", "sqlite3":
+		return dao.NewSQLiteDAO(dsn)
+	case "postgres", "postgresql", "cockroach", "cockroachdb":
+		return dao.NewPostgresDAO(dsn)
+	default:
+		return nil, fmt.Errorf("unsupported database driver: %s", driver)
+	}
+}
+
 func main() {
+	// Handle migration CLI command if requested (requires only DB credentials, no app/vendor secrets)
+	if len(os.Args) > 1 && (os.Args[1] == "migrate" || os.Args[1] == "--migrate") {
+		dbCfg, err := config.LoadDBConfig()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to load database configuration: %v\n", err)
+			os.Exit(1)
+		}
+
+		logLevel := slog.LevelInfo
+		if dbCfg.Debug {
+			logLevel = slog.LevelDebug
+		}
+		logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+			Level: logLevel,
+		}))
+
+		userDAO, err := initUserDAO(dbCfg.Driver, dbCfg.DSN)
+		if err != nil {
+			logger.Error("failed to connect to database", slog.Any("error", err))
+			os.Exit(1)
+		}
+		defer func() {
+			_ = userDAO.Close()
+		}()
+
+		runMigrationCLI(userDAO, os.Args[2:], logger)
+		return
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load configuration: %v\n", err)
@@ -39,16 +80,7 @@ func main() {
 	)
 
 	// Initialize database DAO based on driver
-	var userDAO dao.UserDAO
-	switch strings.ToLower(strings.TrimSpace(cfg.DBDriver)) {
-	case "sqlite", "sqlite3":
-		userDAO, err = dao.NewSQLiteDAO(cfg.DBDSN)
-	case "postgres", "postgresql", "cockroach", "cockroachdb":
-		userDAO, err = dao.NewPostgresDAO(cfg.DBDSN)
-	default:
-		logger.Error("unsupported database driver", slog.String("driver", cfg.DBDriver))
-		os.Exit(1)
-	}
+	userDAO, err := initUserDAO(cfg.DBDriver, cfg.DBDSN)
 	if err != nil {
 		logger.Error("failed to connect to database", slog.Any("error", err))
 		os.Exit(1)
@@ -57,14 +89,16 @@ func main() {
 		_ = userDAO.Close()
 	}()
 
-	// Execute migrations
-	migrateCtx, migrateCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer migrateCancel()
-	if err := userDAO.Migrate(migrateCtx); err != nil {
-		logger.Error("failed to migrate database schema", slog.Any("error", err))
-		os.Exit(1)
+	// Execute migrations on startup if enabled
+	if cfg.MigrateOnStartup {
+		migrateCtx, migrateCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer migrateCancel()
+		if err := userDAO.Migrate(migrateCtx); err != nil {
+			logger.Error("failed to migrate database schema", slog.Any("error", err))
+			os.Exit(1)
+		}
+		logger.Info("database schema migrated successfully")
 	}
-	logger.Info("database schema migrated successfully")
 
 	// Construct API server
 	apiServer, err := api.NewServer(userDAO, cfg.Server, logger)
@@ -106,4 +140,97 @@ func main() {
 	}
 
 	logger.Info("server shut down successfully")
+}
+
+func runMigrationCLI(userDAO dao.UserDAO, args []string, logger *slog.Logger) {
+	migratable, ok := userDAO.(dao.MigratableDAO)
+	if !ok {
+		logger.Error("configured DAO does not support migration operations")
+		os.Exit(1)
+	}
+
+	subcmd := "up"
+	if len(args) > 0 {
+		subcmd = strings.ToLower(strings.TrimSpace(args[0]))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	switch subcmd {
+	case "up":
+		count, err := migratable.MigrateUp(ctx)
+		if err != nil {
+			logger.Error("migration up failed", slog.Any("error", err))
+			os.Exit(1)
+		}
+		ver, err := migratable.MigrationVersion(ctx)
+		if err != nil {
+			logger.Error("failed to retrieve migration version after up", slog.Any("error", err))
+			os.Exit(1)
+		}
+		fmt.Printf("Successfully applied %d migration(s). Current version: %d\n", count, ver)
+
+	case "down":
+		steps := 1
+		if len(args) > 1 {
+			var err error
+			steps, err = strconv.Atoi(args[1])
+			if err != nil || steps < 1 {
+				fmt.Fprintf(os.Stderr, "invalid steps argument: %q (must be a positive integer)\n", args[1])
+				os.Exit(1)
+			}
+		}
+		count, err := migratable.MigrateDown(ctx, steps)
+		if err != nil {
+			logger.Error("migration down failed", slog.Any("error", err))
+			os.Exit(1)
+		}
+		ver, err := migratable.MigrationVersion(ctx)
+		if err != nil {
+			logger.Error("failed to retrieve migration version after down", slog.Any("error", err))
+			os.Exit(1)
+		}
+		fmt.Printf("Successfully rolled back %d migration(s). Current version: %d\n", count, ver)
+
+	case "status":
+		statuses, err := migratable.MigrationStatus(ctx)
+		if err != nil {
+			logger.Error("failed to retrieve migration status", slog.Any("error", err))
+			os.Exit(1)
+		}
+		fmt.Printf("%-8s %-10s %-30s %s\n", "VERSION", "STATUS", "APPLIED AT", "NAME")
+		for _, s := range statuses {
+			statusStr := "PENDING"
+			appliedAtStr := "-"
+			if s.Applied {
+				statusStr = "APPLIED"
+				if s.AppliedAt != nil {
+					appliedAtStr = s.AppliedAt.Format("2006-01-02 15:04:05 UTC")
+				}
+			}
+			fmt.Printf("%06d   %-10s %-30s %s\n", s.Version, statusStr, appliedAtStr, s.Name)
+		}
+
+	case "version":
+		ver, err := migratable.MigrationVersion(ctx)
+		if err != nil {
+			logger.Error("failed to retrieve migration version", slog.Any("error", err))
+			os.Exit(1)
+		}
+		fmt.Printf("Current schema version: %d\n", ver)
+
+	case "help", "--help", "-h":
+		fmt.Println("Usage: lid-server migrate [up|down [steps]|status|version]")
+		fmt.Println()
+		fmt.Println("Commands:")
+		fmt.Println("  up              Apply all pending migrations (default)")
+		fmt.Println("  down [steps]    Roll back [steps] migrations (default: 1)")
+		fmt.Println("  status          Show status of all registered migrations")
+		fmt.Println("  version         Show current database schema version")
+
+	default:
+		fmt.Fprintf(os.Stderr, "unknown migration subcommand: %q. Run 'lid-server migrate help' for usage.\n", subcmd)
+		os.Exit(1)
+	}
 }

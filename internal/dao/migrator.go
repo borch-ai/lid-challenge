@@ -362,26 +362,40 @@ func (m *Migrator) releaseLock(ctx context.Context, lockOwner string) error {
 // breakStaleLock clears any lock that has exceeded staleLockTimeout without heartbeat renewal.
 // For SQLite, an active transaction holds an exclusive database write lock and connection pool
 // size is typically 1 (SetMaxOpenConns(1)), preventing lease renewal during long DDL operations.
-// Therefore, SQLite employs process-liveness checking so active processes are never reclaimed.
+// Therefore, SQLite employs host-local process-liveness checking so active processes are never reclaimed.
+// Cross-host shared SQLite migration (e.g. across hosts or containers sharing a network volume)
+// cannot verify remote process liveness, so SQLite migration fails closed (never reclaims a lock
+// owned by another host or unparseable host) to prevent concurrent DDL execution.
 func (m *Migrator) breakStaleLock(ctx context.Context, now time.Time) {
 	staleThreshold := now.Add(-staleLockTimeout)
 
 	if m.dialect.Name() == "sqlite" {
 		var lockedBy sql.NullString
 		err := m.db.QueryRowContext(ctx, "SELECT locked_by FROM schema_migrations_lock WHERE id = 1 AND is_locked = 1").Scan(&lockedBy)
-		if err == nil && lockedBy.Valid && lockedBy.String != "" {
-			parts := strings.Split(lockedBy.String, ":")
-			if len(parts) >= 2 {
-				currentHostname, _ := os.Hostname()
-				if parts[0] == currentHostname {
-					if pid, err := strconv.Atoi(parts[1]); err == nil && isProcessAlive(pid) {
-						// Owning process is alive and actively running; do not reclaim lock.
-						return
-					}
-				}
-			}
+		if err != nil || !lockedBy.Valid || lockedBy.String == "" {
+			return
 		}
 
+		parts := strings.Split(lockedBy.String, ":")
+		if len(parts) < 2 {
+			// Malformed lock owner on SQLite fails closed to prevent unsafe takeover.
+			return
+		}
+
+		currentHostname, _ := os.Hostname()
+		if parts[0] != currentHostname {
+			// Cross-host or cross-container shared SQLite file migrations cannot verify remote process liveness.
+			// Fail closed and do not reclaim to prevent concurrent DDL execution against an active transaction.
+			return
+		}
+
+		pid, err := strconv.Atoi(parts[1])
+		if err != nil || isProcessAlive(pid) {
+			// Owning process is alive (or PID unparseable); do not reclaim lock.
+			return
+		}
+
+		// Owning process on the local host is confirmed dead; reclaim the stale lock.
 		staleParam := staleThreshold.Format(time.RFC3339Nano)
 		query := m.dialect.Rebind(`
 			UPDATE schema_migrations_lock

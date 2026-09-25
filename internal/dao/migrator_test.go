@@ -440,20 +440,9 @@ func TestSQLDAO_MigratableDAO_Methods(t *testing.T) {
 	if _, err := nilMigratorDAO.MigrationStatus(ctx); err == nil {
 		t.Errorf("expected error for MigrationStatus with nil migrator")
 	}
-	// Migrate fallback with nil migrator executes SchemaDDL directly
-	if err := nilMigratorDAO.Migrate(ctx); err != nil {
-		t.Fatalf("expected fallback Migrate to succeed, got %v", err)
-	}
-
-	// Migrate fallback with closed DB triggers error
-	closedDB, _ := sql.Open("sqlite", "file::memory:?cache=shared")
-	_ = closedDB.Close()
-	closedMigratorDAO := &SQLDAO{
-		db:      closedDB,
-		dialect: dao.dialect,
-	}
-	if err := closedMigratorDAO.Migrate(ctx); err == nil {
-		t.Errorf("expected error from fallback Migrate on closed DB, got nil")
+	// Migrate with nil migrator must return an error
+	if err := nilMigratorDAO.Migrate(ctx); err == nil {
+		t.Errorf("expected error for Migrate with nil migrator")
 	}
 }
 
@@ -615,8 +604,10 @@ func TestMigrator_Lock_And_BreakStaleLock(t *testing.T) {
 	}
 
 	// 1. Manually set stale lock (locked 10 minutes ago)
+	hostname, _ := os.Hostname()
+	deadOwner := fmt.Sprintf("%s:9999999:crashed_pod", hostname)
 	staleTime := time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339Nano)
-	_, err = db.ExecContext(ctx, "UPDATE schema_migrations_lock SET is_locked = 1, locked_at = ?, locked_by = 'crashed_pod' WHERE id = 1", staleTime)
+	_, err = db.ExecContext(ctx, "UPDATE schema_migrations_lock SET is_locked = 1, locked_at = ?, locked_by = ? WHERE id = 1", staleTime, deadOwner)
 	if err != nil {
 		t.Fatalf("failed to insert stale lock: %v", err)
 	}
@@ -824,6 +815,28 @@ func TestMigrator_SQLite_ProcessLiveness_Lock(t *testing.T) {
 	if isLocked {
 		t.Errorf("expected lock to be broken for dead local process, but it remained locked")
 	}
+
+	// 3. Lock held by remote host (cross-host SQLite file sharing simulation)
+	remoteOwner := "other-remote-host:1234:token3"
+	_, _ = db.ExecContext(ctx, "UPDATE schema_migrations_lock SET is_locked = 1, locked_at = ?, locked_by = ? WHERE id = 1", staleTime, remoteOwner)
+
+	// breakStaleLock must NOT reclaim the lock because remote process liveness cannot be verified (fails closed)
+	m.breakStaleLock(ctx, time.Now().UTC())
+
+	_ = db.QueryRowContext(ctx, "SELECT is_locked FROM schema_migrations_lock WHERE id = 1").Scan(&isLocked)
+	if !isLocked {
+		t.Errorf("expected lock to remain held for remote host, but it was reclaimed")
+	}
+
+	// 4. Lock held by malformed owner string (fails closed)
+	malformedOwner := "singlepartowner"
+	_, _ = db.ExecContext(ctx, "UPDATE schema_migrations_lock SET is_locked = 1, locked_at = ?, locked_by = ? WHERE id = 1", staleTime, malformedOwner)
+
+	m.breakStaleLock(ctx, time.Now().UTC())
+	_ = db.QueryRowContext(ctx, "SELECT is_locked FROM schema_migrations_lock WHERE id = 1").Scan(&isLocked)
+	if !isLocked {
+		t.Errorf("expected lock to remain held for malformed owner, but it was reclaimed")
+	}
 }
 
 func TestMigrator_Validation_Branches(t *testing.T) {
@@ -837,6 +850,12 @@ func TestMigrator_Validation_Branches(t *testing.T) {
 	}
 	if _, err := NewMigrator(db, unsupportedDialect{}); err == nil {
 		t.Errorf("expected error for unsupported dialect")
+	}
+	if _, err := NewSQLDAO(db, unsupportedDialect{}); err == nil {
+		t.Errorf("expected error for NewSQLDAO with unsupported dialect")
+	}
+	if validDAO, err := NewSQLDAO(db, SQLiteDialect{}); err != nil || validDAO == nil {
+		t.Errorf("expected NewSQLDAO with SQLiteDialect to succeed, got %v", err)
 	}
 
 	// Test EnsureTable, Version, Status, getAppliedMigrations with closed db
@@ -899,4 +918,60 @@ func TestMigrator_LockLost_FencesMigration(t *testing.T) {
 		t.Errorf("expected errLockLost, got: %v", err)
 	}
 	_ = migrationCtx
+}
+
+func TestMigrator_MoreEdgeCases(t *testing.T) {
+	// isProcessAlive edge cases
+	if isProcessAlive(0) {
+		t.Errorf("expected isProcessAlive(0) to be false")
+	}
+	if isProcessAlive(-1) {
+		t.Errorf("expected isProcessAlive(-1) to be false")
+	}
+
+	// parseMigrationTime branches
+	now := time.Now().UTC()
+	if parsed, err := parseMigrationTime(now); err != nil || !parsed.Equal(now) {
+		t.Errorf("expected parseMigrationTime(time.Time) to return identity, got %v, %v", parsed, err)
+	}
+	if parsed, err := parseMigrationTime(now.Format(time.RFC3339Nano)); err != nil || parsed.IsZero() {
+		t.Errorf("expected parseMigrationTime(string) to succeed, got %v, %v", parsed, err)
+	}
+	if parsed, err := parseMigrationTime([]byte(now.Format(time.RFC3339))); err != nil || parsed.IsZero() {
+		t.Errorf("expected parseMigrationTime([]byte) to succeed, got %v, %v", parsed, err)
+	}
+	if _, err := parseMigrationTime("not-a-valid-timestamp"); err == nil {
+		t.Errorf("expected error for unparseable timestamp string")
+	}
+	if _, err := parseMigrationTime(12345); err == nil {
+		t.Errorf("expected error for invalid type passed to parseMigrationTime")
+	}
+
+	// renewLock, releaseLock, breakStaleLock error paths on closed db
+	closedDB, _ := sql.Open("sqlite", "file::memory:?cache=shared")
+	_ = closedDB.Close()
+	mClosed := &Migrator{db: closedDB, dialect: SQLiteDialect{}}
+	if err := mClosed.renewLock(context.Background(), "owner"); err == nil {
+		t.Errorf("expected renewLock to fail on closed db")
+	}
+	if err := mClosed.releaseLock(context.Background(), "owner"); err == nil {
+		t.Errorf("expected releaseLock to fail on closed db")
+	}
+	mClosed.breakStaleLock(context.Background(), time.Now().UTC())
+
+	// getAppliedMigrations corrupt timestamp test
+	validDB, err := sql.Open("sqlite", "file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("failed to open sqlite database: %v", err)
+	}
+	defer func() { _ = validDB.Close() }()
+	mValid, err := NewMigrator(validDB, SQLiteDialect{})
+	if err != nil {
+		t.Fatalf("failed to create migrator: %v", err)
+	}
+	_ = mValid.EnsureTable(context.Background())
+	_, _ = validDB.ExecContext(context.Background(), "INSERT INTO schema_migrations (version, name, applied_at) VALUES (999, 'corrupt', 'not-a-timestamp')")
+	if _, err := mValid.getAppliedMigrations(context.Background()); err == nil {
+		t.Errorf("expected getAppliedMigrations to fail with corrupted applied_at timestamp")
+	}
 }

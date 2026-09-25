@@ -2,8 +2,10 @@ package dao
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"embed"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -12,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -81,8 +84,11 @@ func LoadMigrations(fsys fs.FS, dir string) ([]Migration, error) {
 		}
 
 		version, err := strconv.ParseInt(parts[0], 10, 64)
-		if err != nil || version <= 0 {
+		if err != nil {
 			return nil, fmt.Errorf("invalid migration version in filename %q: %w", name, err)
+		}
+		if version <= 0 {
+			return nil, fmt.Errorf("invalid migration version in filename %q: version must be positive", name)
 		}
 		migName := parts[1]
 
@@ -211,10 +217,19 @@ func (m *Migrator) EnsureTable(ctx context.Context) error {
 	return fmt.Errorf("failed to create schema_migrations tables: %w", lastErr)
 }
 
+const (
+	lockHeartbeatInterval = 5 * time.Second
+	staleLockTimeout      = 1 * time.Minute
+)
+
 // acquireLock acquires an exclusive distributed lock on schema_migrations_lock, retrying until ctx expires.
-func (m *Migrator) acquireLock(ctx context.Context) error {
+// On success, it launches a background heartbeat goroutine to continuously renew the lock lease,
+// and returns an unlock function that stops the heartbeat and releases the lock with ownership fencing.
+func (m *Migrator) acquireLock(ctx context.Context) (func(), error) {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
 	hostname, _ := os.Hostname()
-	lockOwner := fmt.Sprintf("%s:%d", hostname, os.Getpid())
+	lockOwner := fmt.Sprintf("%s:%d:%s", hostname, os.Getpid(), hex.EncodeToString(b))
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -225,6 +240,12 @@ func (m *Migrator) acquireLock(ctx context.Context) error {
 	`)
 
 	for {
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("timeout or canceled while waiting for migration lock: %w", ctx.Err())
+		default:
+		}
+
 		now := time.Now().UTC()
 		var nowParam any = now
 		if m.dialect.Name() == "sqlite" {
@@ -235,34 +256,79 @@ func (m *Migrator) acquireLock(ctx context.Context) error {
 		if err == nil {
 			rows, _ := res.RowsAffected()
 			if rows == 1 {
-				return nil
+				heartbeatCtx, cancelHeartbeat := context.WithCancel(context.Background())
+				var wg sync.WaitGroup
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					hbTicker := time.NewTicker(lockHeartbeatInterval)
+					defer hbTicker.Stop()
+					for {
+						select {
+						case <-heartbeatCtx.Done():
+							return
+						case <-hbTicker.C:
+							_ = m.renewLock(heartbeatCtx, lockOwner)
+						}
+					}
+				}()
+
+				var once sync.Once
+				unlock := func() {
+					once.Do(func() {
+						cancelHeartbeat()
+						wg.Wait()
+						relCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+						defer cancel()
+						_ = m.releaseLock(relCtx, lockOwner)
+					})
+				}
+				return unlock, nil
 			}
 		}
 
-		// Break stale locks older than 2 minutes (e.g. from crashed containers)
+		// Break stale locks older than staleLockTimeout (e.g. from crashed containers)
 		m.breakStaleLock(ctx, now)
 
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("timeout or canceled while waiting for migration lock: %w", ctx.Err())
+			return nil, fmt.Errorf("timeout or canceled while waiting for migration lock: %w", ctx.Err())
 		case <-ticker.C:
 		}
 	}
 }
 
-// releaseLock releases the exclusive distributed lock on schema_migrations_lock.
-func (m *Migrator) releaseLock(ctx context.Context) error {
-	query := `
+// renewLock extends the lock lease timestamp for the active lock owner.
+func (m *Migrator) renewLock(ctx context.Context, lockOwner string) error {
+	now := time.Now().UTC()
+	var nowParam any = now
+	if m.dialect.Name() == "sqlite" {
+		nowParam = now.Format(time.RFC3339Nano)
+	}
+	query := m.dialect.Rebind(`
 		UPDATE schema_migrations_lock
-		SET is_locked = FALSE, locked_at = NULL, locked_by = NULL
-		WHERE id = 1
-	`
-	_, err := m.db.ExecContext(ctx, query)
+		SET locked_at = ?
+		WHERE id = 1 AND is_locked = TRUE AND locked_by = ?
+	`)
+	_, err := m.db.ExecContext(ctx, query, nowParam, lockOwner)
 	return err
 }
 
+// releaseLock releases the exclusive distributed lock on schema_migrations_lock,
+// verifying current lock ownership so it never clears another replica's lock.
+func (m *Migrator) releaseLock(ctx context.Context, lockOwner string) error {
+	query := m.dialect.Rebind(`
+		UPDATE schema_migrations_lock
+		SET is_locked = FALSE, locked_at = NULL, locked_by = NULL
+		WHERE id = 1 AND locked_by = ?
+	`)
+	_, err := m.db.ExecContext(ctx, query, lockOwner)
+	return err
+}
+
+// breakStaleLock clears any lock that has exceeded staleLockTimeout without heartbeat renewal.
 func (m *Migrator) breakStaleLock(ctx context.Context, now time.Time) {
-	staleThreshold := now.Add(-2 * time.Minute)
+	staleThreshold := now.Add(-staleLockTimeout)
 	var staleParam any = staleThreshold
 	if m.dialect.Name() == "sqlite" {
 		staleParam = staleThreshold.Format(time.RFC3339Nano)
@@ -338,14 +404,11 @@ func (m *Migrator) Up(ctx context.Context) (int, error) {
 		return 0, err
 	}
 
-	if err := m.acquireLock(ctx); err != nil {
+	unlock, err := m.acquireLock(ctx)
+	if err != nil {
 		return 0, fmt.Errorf("failed to acquire migration lock: %w", err)
 	}
-	defer func() {
-		relCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = m.releaseLock(relCtx)
-	}()
+	defer unlock()
 
 	applied, err := m.getAppliedVersions(ctx)
 	if err != nil {
@@ -373,14 +436,11 @@ func (m *Migrator) Down(ctx context.Context, steps int) (int, error) {
 		return 0, err
 	}
 
-	if err := m.acquireLock(ctx); err != nil {
+	unlock, err := m.acquireLock(ctx)
+	if err != nil {
 		return 0, fmt.Errorf("failed to acquire migration lock: %w", err)
 	}
-	defer func() {
-		relCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = m.releaseLock(relCtx)
-	}()
+	defer unlock()
 
 	applied, err := m.getAppliedVersions(ctx)
 	if err != nil {

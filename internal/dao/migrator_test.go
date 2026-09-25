@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -233,6 +234,16 @@ func TestMigrator_ErrorCases_Validation(t *testing.T) {
 	}
 	if _, err := LoadMigrations(conflictNameFS, "migrations"); err == nil {
 		t.Errorf("expected error for conflicting migration names, got nil")
+	}
+
+	// 10. Zero/negative migration version
+	zeroVersionFS := fstest.MapFS{
+		"migrations/000000_zero.up.sql": &fstest.MapFile{Data: []byte("CREATE TABLE zero(id INT);")},
+	}
+	if _, err := LoadMigrations(zeroVersionFS, "migrations"); err == nil {
+		t.Errorf("expected error for zero migration version, got nil")
+	} else if !strings.Contains(err.Error(), "version must be positive") {
+		t.Errorf("expected error to contain 'version must be positive', got %v", err)
 	}
 }
 
@@ -568,7 +579,53 @@ func TestMigrator_Lock_And_BreakStaleLock(t *testing.T) {
 	// Lock the table so acquireLock cannot immediately grab it
 	_, _ = db.ExecContext(ctx, "UPDATE schema_migrations_lock SET is_locked = 1, locked_at = ?, locked_by = 'holder' WHERE id = 1", time.Now().UTC().Format(time.RFC3339Nano))
 
-	if err := m.acquireLock(canceledCtx); err == nil {
+	if _, err := m.acquireLock(canceledCtx); err == nil {
 		t.Errorf("expected acquireLock to fail with canceled context, got nil")
+	}
+
+	// 3. Test ownership fencing on releaseLock
+	// Wrong owner cannot release lock
+	if err := m.releaseLock(ctx, "wrong-owner"); err != nil {
+		t.Fatalf("releaseLock unexpected error: %v", err)
+	}
+	var isStillLocked bool
+	var lockedBy string
+	_ = db.QueryRowContext(ctx, "SELECT is_locked, locked_by FROM schema_migrations_lock WHERE id = 1").Scan(&isStillLocked, &lockedBy)
+	if !isStillLocked || lockedBy != "holder" {
+		t.Errorf("expected lock to remain held by 'holder', got is_locked=%v, locked_by=%s", isStillLocked, lockedBy)
+	}
+
+	// Right owner releases lock successfully
+	if err := m.releaseLock(ctx, "holder"); err != nil {
+		t.Fatalf("releaseLock error: %v", err)
+	}
+	_ = db.QueryRowContext(ctx, "SELECT is_locked FROM schema_migrations_lock WHERE id = 1").Scan(&isStillLocked)
+	if isStillLocked {
+		t.Errorf("expected lock to be released (is_locked=false), got true")
+	}
+
+	// 4. Test acquireLock and unlock function lifecycle
+	unlock, err := m.acquireLock(ctx)
+	if err != nil {
+		t.Fatalf("failed to acquire lock: %v", err)
+	}
+	_ = db.QueryRowContext(ctx, "SELECT is_locked FROM schema_migrations_lock WHERE id = 1").Scan(&isStillLocked)
+	if !isStillLocked {
+		t.Errorf("expected lock to be acquired, got false")
+	}
+
+	// renewLock test
+	if err := m.renewLock(ctx, "nonexistent"); err != nil {
+		t.Errorf("renewLock failed: %v", err)
+	}
+	if err := pgM.renewLock(ctx, "nonexistent"); err != nil {
+		t.Errorf("pgM.renewLock failed: %v", err)
+	}
+
+	// Unlock successfully
+	unlock()
+	_ = db.QueryRowContext(ctx, "SELECT is_locked FROM schema_migrations_lock WHERE id = 1").Scan(&isStillLocked)
+	if isStillLocked {
+		t.Errorf("expected unlock() to release lock, got true")
 	}
 }

@@ -606,14 +606,14 @@ func TestMigrator_Lock_And_BreakStaleLock(t *testing.T) {
 	// 1. Manually set stale lock (locked 10 minutes ago)
 	hostname, _ := os.Hostname()
 	deadOwner := fmt.Sprintf("%s:9999999:crashed_pod", hostname)
-	staleTime := time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339Nano)
+	staleTime := time.Now().UTC().Add(-10 * time.Minute).Format("2006-01-02 15:04:05")
 	_, err = db.ExecContext(ctx, "UPDATE schema_migrations_lock SET is_locked = 1, locked_at = ?, locked_by = ? WHERE id = 1", staleTime, deadOwner)
 	if err != nil {
 		t.Fatalf("failed to insert stale lock: %v", err)
 	}
 
 	// breakStaleLock should clear it
-	m.breakStaleLock(ctx, time.Now().UTC())
+	m.breakStaleLock(ctx)
 
 	var isLocked bool
 	err = db.QueryRowContext(ctx, "SELECT is_locked FROM schema_migrations_lock WHERE id = 1").Scan(&isLocked)
@@ -626,7 +626,7 @@ func TestMigrator_Lock_And_BreakStaleLock(t *testing.T) {
 
 	// Also test breakStaleLock with PostgresDialect
 	pgM := &Migrator{db: db, dialect: PostgresDialect{}}
-	pgM.breakStaleLock(ctx, time.Now().UTC())
+	pgM.breakStaleLock(ctx)
 
 	// 2. acquireLock with already-canceled context
 	canceledCtx, cancel := context.WithCancel(context.Background())
@@ -792,11 +792,11 @@ func TestMigrator_SQLite_ProcessLiveness_Lock(t *testing.T) {
 	// 1. Lock held by current PID on current host (active transaction simulation)
 	hostname, _ := os.Hostname()
 	aliveOwner := fmt.Sprintf("%s:%d:token1", hostname, os.Getpid())
-	staleTime := time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339Nano)
+	staleTime := time.Now().UTC().Add(-10 * time.Minute).Format("2006-01-02 15:04:05")
 	_, _ = db.ExecContext(ctx, "UPDATE schema_migrations_lock SET is_locked = 1, locked_at = ?, locked_by = ? WHERE id = 1", staleTime, aliveOwner)
 
 	// breakStaleLock must NOT reclaim the lock because the PID is alive on this host
-	m.breakStaleLock(ctx, time.Now().UTC())
+	m.breakStaleLock(ctx)
 
 	var isLocked bool
 	_ = db.QueryRowContext(ctx, "SELECT is_locked FROM schema_migrations_lock WHERE id = 1").Scan(&isLocked)
@@ -809,7 +809,7 @@ func TestMigrator_SQLite_ProcessLiveness_Lock(t *testing.T) {
 	_, _ = db.ExecContext(ctx, "UPDATE schema_migrations_lock SET is_locked = 1, locked_at = ?, locked_by = ? WHERE id = 1", staleTime, deadOwner)
 
 	// breakStaleLock MUST reclaim the lock because the PID is dead
-	m.breakStaleLock(ctx, time.Now().UTC())
+	m.breakStaleLock(ctx)
 
 	_ = db.QueryRowContext(ctx, "SELECT is_locked FROM schema_migrations_lock WHERE id = 1").Scan(&isLocked)
 	if isLocked {
@@ -821,7 +821,7 @@ func TestMigrator_SQLite_ProcessLiveness_Lock(t *testing.T) {
 	_, _ = db.ExecContext(ctx, "UPDATE schema_migrations_lock SET is_locked = 1, locked_at = ?, locked_by = ? WHERE id = 1", staleTime, remoteOwner)
 
 	// breakStaleLock must NOT reclaim the lock because remote process liveness cannot be verified (fails closed)
-	m.breakStaleLock(ctx, time.Now().UTC())
+	m.breakStaleLock(ctx)
 
 	_ = db.QueryRowContext(ctx, "SELECT is_locked FROM schema_migrations_lock WHERE id = 1").Scan(&isLocked)
 	if !isLocked {
@@ -832,7 +832,7 @@ func TestMigrator_SQLite_ProcessLiveness_Lock(t *testing.T) {
 	malformedOwner := "singlepartowner"
 	_, _ = db.ExecContext(ctx, "UPDATE schema_migrations_lock SET is_locked = 1, locked_at = ?, locked_by = ? WHERE id = 1", staleTime, malformedOwner)
 
-	m.breakStaleLock(ctx, time.Now().UTC())
+	m.breakStaleLock(ctx)
 	_ = db.QueryRowContext(ctx, "SELECT is_locked FROM schema_migrations_lock WHERE id = 1").Scan(&isLocked)
 	if !isLocked {
 		t.Errorf("expected lock to remain held for malformed owner, but it was reclaimed")
@@ -957,7 +957,7 @@ func TestMigrator_MoreEdgeCases(t *testing.T) {
 	if err := mClosed.releaseLock(context.Background(), "owner"); err == nil {
 		t.Errorf("expected releaseLock to fail on closed db")
 	}
-	mClosed.breakStaleLock(context.Background(), time.Now().UTC())
+	mClosed.breakStaleLock(context.Background())
 
 	// getAppliedMigrations corrupt timestamp test
 	validDB, err := sql.Open("sqlite", "file::memory:?cache=shared")

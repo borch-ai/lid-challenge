@@ -243,11 +243,20 @@ func (m *Migrator) acquireLock(ctx context.Context) (context.Context, func(), er
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 
-	query := m.dialect.Rebind(`
-		UPDATE schema_migrations_lock
-		SET is_locked = TRUE, locked_at = ?, locked_by = ?
-		WHERE id = 1 AND is_locked = FALSE
-	`)
+	var query string
+	if m.dialect.Name() == "sqlite" {
+		query = `
+			UPDATE schema_migrations_lock
+			SET is_locked = 1, locked_at = datetime('now'), locked_by = ?
+			WHERE id = 1 AND is_locked = 0
+		`
+	} else {
+		query = `
+			UPDATE schema_migrations_lock
+			SET is_locked = TRUE, locked_at = CURRENT_TIMESTAMP, locked_by = $1
+			WHERE id = 1 AND is_locked = FALSE
+		`
+	}
 
 	for {
 		select {
@@ -256,13 +265,7 @@ func (m *Migrator) acquireLock(ctx context.Context) (context.Context, func(), er
 		default:
 		}
 
-		now := time.Now().UTC()
-		var nowParam any = now
-		if m.dialect.Name() == "sqlite" {
-			nowParam = now.Format(time.RFC3339Nano)
-		}
-
-		res, err := m.db.ExecContext(ctx, query, nowParam, lockOwner)
+		res, err := m.db.ExecContext(ctx, query, lockOwner)
 		if err == nil {
 			rows, _ := res.RowsAffected()
 			if rows == 1 {
@@ -311,7 +314,7 @@ func (m *Migrator) acquireLock(ctx context.Context) (context.Context, func(), er
 		}
 
 		// Break stale locks older than staleLockTimeout (e.g. from crashed containers)
-		m.breakStaleLock(ctx, now)
+		m.breakStaleLock(ctx)
 
 		select {
 		case <-ctx.Done():
@@ -321,19 +324,23 @@ func (m *Migrator) acquireLock(ctx context.Context) (context.Context, func(), er
 	}
 }
 
-// renewLock extends the lock lease timestamp for the active lock owner.
+// renewLock extends the lock lease timestamp for the active lock owner using database-side timestamps.
 func (m *Migrator) renewLock(ctx context.Context, lockOwner string) error {
-	now := time.Now().UTC()
-	var nowParam any = now
+	var query string
 	if m.dialect.Name() == "sqlite" {
-		nowParam = now.Format(time.RFC3339Nano)
+		query = `
+			UPDATE schema_migrations_lock
+			SET locked_at = datetime('now')
+			WHERE id = 1 AND is_locked = 1 AND locked_by = ?
+		`
+	} else {
+		query = `
+			UPDATE schema_migrations_lock
+			SET locked_at = CURRENT_TIMESTAMP
+			WHERE id = 1 AND is_locked = TRUE AND locked_by = $1
+		`
 	}
-	query := m.dialect.Rebind(`
-		UPDATE schema_migrations_lock
-		SET locked_at = ?
-		WHERE id = 1 AND is_locked = TRUE AND locked_by = ?
-	`)
-	res, err := m.db.ExecContext(ctx, query, nowParam, lockOwner)
+	res, err := m.db.ExecContext(ctx, query, lockOwner)
 	if err != nil {
 		return err
 	}
@@ -360,15 +367,15 @@ func (m *Migrator) releaseLock(ctx context.Context, lockOwner string) error {
 }
 
 // breakStaleLock clears any lock that has exceeded staleLockTimeout without heartbeat renewal.
+// Database server-side timestamp comparisons are used rather than client clocks to ensure immunity
+// to client clock skew across distinct replica hosts.
 // For SQLite, an active transaction holds an exclusive database write lock and connection pool
 // size is typically 1 (SetMaxOpenConns(1)), preventing lease renewal during long DDL operations.
 // Therefore, SQLite employs host-local process-liveness checking so active processes are never reclaimed.
 // Cross-host shared SQLite migration (e.g. across hosts or containers sharing a network volume)
 // cannot verify remote process liveness, so SQLite migration fails closed (never reclaims a lock
 // owned by another host or unparseable host) to prevent concurrent DDL execution.
-func (m *Migrator) breakStaleLock(ctx context.Context, now time.Time) {
-	staleThreshold := now.Add(-staleLockTimeout)
-
+func (m *Migrator) breakStaleLock(ctx context.Context) {
 	if m.dialect.Name() == "sqlite" {
 		var lockedBy sql.NullString
 		err := m.db.QueryRowContext(ctx, "SELECT locked_by FROM schema_migrations_lock WHERE id = 1 AND is_locked = 1").Scan(&lockedBy)
@@ -395,35 +402,38 @@ func (m *Migrator) breakStaleLock(ctx context.Context, now time.Time) {
 			return
 		}
 
-		// Owning process on the local host is confirmed dead; reclaim the stale lock.
-		staleParam := staleThreshold.Format(time.RFC3339Nano)
-		query := m.dialect.Rebind(`
+		// Owning process on the local host is confirmed dead; reclaim the stale lock using database-side timestamp.
+		query := `
 			UPDATE schema_migrations_lock
-			SET is_locked = FALSE, locked_at = NULL, locked_by = NULL
-			WHERE id = 1 AND is_locked = TRUE AND locked_at < ?
-		`)
-		_, _ = m.db.ExecContext(ctx, query, staleParam)
+			SET is_locked = 0, locked_at = NULL, locked_by = NULL
+			WHERE id = 1 AND is_locked = 1 AND (locked_at IS NULL OR locked_at < datetime('now', '-60 seconds'))
+		`
+		_, _ = m.db.ExecContext(ctx, query)
 		return
 	}
 
-	query := m.dialect.Rebind(`
+	// For Postgres / CockroachDB: use database server timestamp age comparison to be client clock-skew independent.
+	query := `
 		UPDATE schema_migrations_lock
 		SET is_locked = FALSE, locked_at = NULL, locked_by = NULL
-		WHERE id = 1 AND is_locked = TRUE AND locked_at < ?
-	`)
-	_, _ = m.db.ExecContext(ctx, query, staleThreshold)
+		WHERE id = 1 AND is_locked = TRUE AND (locked_at IS NULL OR locked_at < CURRENT_TIMESTAMP - INTERVAL '60 seconds')
+	`
+	_, _ = m.db.ExecContext(ctx, query)
 }
 
 func isProcessAlive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	proc, err := os.FindProcess(pid)
-	if err != nil {
+	err := syscall.Kill(pid, syscall.Signal(0))
+	if err == nil || errors.Is(err, syscall.EPERM) {
+		return true
+	}
+	if errors.Is(err, syscall.ESRCH) {
 		return false
 	}
-	err = proc.Signal(syscall.Signal(0))
-	return err == nil
+	// Fail closed if any other error occurs to prevent reclaiming an active lock.
+	return true
 }
 
 func (m *Migrator) applyMigration(ctx context.Context, migration Migration) error {

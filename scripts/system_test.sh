@@ -354,6 +354,10 @@ echo "PASS (HTTP 200) -> Pagination working as expected"
 # 13. Schema Migration CLI verification
 if [ -n "${ACTUAL_DSN:-}" ]; then
   echo -n "13. Testing Schema Migration CLI (status & version)... "
+  if [ ! -f ./bin/lid-server ]; then
+    mkdir -p ./bin
+    go build -o ./bin/lid-server ./cmd/server
+  fi
   CLI_DRIVER="${ACTUAL_DRIVER:-sqlite}"
   STATUS_OUT=$(APP_ENV="$APP_ENV" AUTH_SECRET="$AUTH_SECRET" DB_DRIVER="$CLI_DRIVER" DB_DSN="$ACTUAL_DSN" ./bin/lid-server migrate status 2>&1)
   if ! echo "$STATUS_OUT" | grep -q "APPLIED"; then

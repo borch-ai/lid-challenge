@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -268,7 +269,9 @@ func (m *Migrator) acquireLock(ctx context.Context) (func(), error) {
 						case <-heartbeatCtx.Done():
 							return
 						case <-hbTicker.C:
-							_ = m.renewLock(heartbeatCtx, lockOwner)
+							renewCtx, renewCancel := context.WithTimeout(heartbeatCtx, 1*time.Second)
+							_ = m.renewLock(renewCtx, lockOwner)
+							renewCancel()
 						}
 					}
 				}()
@@ -327,18 +330,56 @@ func (m *Migrator) releaseLock(ctx context.Context, lockOwner string) error {
 }
 
 // breakStaleLock clears any lock that has exceeded staleLockTimeout without heartbeat renewal.
+// For SQLite, an active transaction holds an exclusive database write lock and connection pool
+// size is typically 1 (SetMaxOpenConns(1)), preventing lease renewal during long DDL operations.
+// Therefore, SQLite employs process-liveness checking so active processes are never reclaimed.
 func (m *Migrator) breakStaleLock(ctx context.Context, now time.Time) {
 	staleThreshold := now.Add(-staleLockTimeout)
-	var staleParam any = staleThreshold
+
 	if m.dialect.Name() == "sqlite" {
-		staleParam = staleThreshold.Format(time.RFC3339Nano)
+		var lockedBy sql.NullString
+		err := m.db.QueryRowContext(ctx, "SELECT locked_by FROM schema_migrations_lock WHERE id = 1 AND is_locked = 1").Scan(&lockedBy)
+		if err == nil && lockedBy.Valid && lockedBy.String != "" {
+			parts := strings.Split(lockedBy.String, ":")
+			if len(parts) >= 2 {
+				currentHostname, _ := os.Hostname()
+				if parts[0] == currentHostname {
+					if pid, err := strconv.Atoi(parts[1]); err == nil && isProcessAlive(pid) {
+						// Owning process is alive and actively running; do not reclaim lock.
+						return
+					}
+				}
+			}
+		}
+
+		staleParam := staleThreshold.Format(time.RFC3339Nano)
+		query := m.dialect.Rebind(`
+			UPDATE schema_migrations_lock
+			SET is_locked = FALSE, locked_at = NULL, locked_by = NULL
+			WHERE id = 1 AND is_locked = TRUE AND locked_at < ?
+		`)
+		_, _ = m.db.ExecContext(ctx, query, staleParam)
+		return
 	}
+
 	query := m.dialect.Rebind(`
 		UPDATE schema_migrations_lock
 		SET is_locked = FALSE, locked_at = NULL, locked_by = NULL
 		WHERE id = 1 AND is_locked = TRUE AND locked_at < ?
 	`)
-	_, _ = m.db.ExecContext(ctx, query, staleParam)
+	_, _ = m.db.ExecContext(ctx, query, staleThreshold)
+}
+
+func isProcessAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	err = proc.Signal(syscall.Signal(0))
+	return err == nil
 }
 
 func (m *Migrator) applyMigration(ctx context.Context, migration Migration) error {
@@ -410,8 +451,11 @@ func (m *Migrator) Up(ctx context.Context) (int, error) {
 	}
 	defer unlock()
 
-	applied, err := m.getAppliedVersions(ctx)
+	applied, err := m.getAppliedMigrations(ctx)
 	if err != nil {
+		return 0, err
+	}
+	if err := m.validateAppliedMigrations(applied); err != nil {
 		return 0, err
 	}
 
@@ -442,8 +486,11 @@ func (m *Migrator) Down(ctx context.Context, steps int) (int, error) {
 	}
 	defer unlock()
 
-	applied, err := m.getAppliedVersions(ctx)
+	applied, err := m.getAppliedMigrations(ctx)
 	if err != nil {
+		return 0, err
+	}
+	if err := m.validateAppliedMigrations(applied); err != nil {
 		return 0, err
 	}
 
@@ -493,29 +540,49 @@ func (m *Migrator) Version(ctx context.Context) (int64, error) {
 	return version.Int64, nil
 }
 
-// Status returns the status for all known migrations.
+// Status returns the status for all known migrations, plus any unknown migrations recorded in the database.
 func (m *Migrator) Status(ctx context.Context) ([]MigrationStatus, error) {
 	if err := m.EnsureTable(ctx); err != nil {
 		return nil, err
 	}
 
-	applied, err := m.getAppliedVersions(ctx)
+	applied, err := m.getAppliedMigrations(ctx)
 	if err != nil {
 		return nil, err
 	}
 
+	known := make(map[int64]struct{}, len(m.migrations))
 	statuses := make([]MigrationStatus, 0, len(m.migrations))
 	for _, mig := range m.migrations {
+		known[mig.Version] = struct{}{}
 		st := MigrationStatus{
 			Version: mig.Version,
 			Name:    mig.Name,
 		}
-		if appliedAt, ok := applied[mig.Version]; ok {
+		if rec, ok := applied[mig.Version]; ok {
 			st.Applied = true
-			st.AppliedAt = &appliedAt
+			appliedAtCopy := rec.AppliedAt
+			st.AppliedAt = &appliedAtCopy
 		}
 		statuses = append(statuses, st)
 	}
+
+	for ver, rec := range applied {
+		if _, exists := known[ver]; !exists {
+			appliedAtCopy := rec.AppliedAt
+			statuses = append(statuses, MigrationStatus{
+				Version:   ver,
+				Name:      rec.Name + " (unknown)",
+				Applied:   true,
+				AppliedAt: &appliedAtCopy,
+			})
+		}
+	}
+
+	sort.Slice(statuses, func(i, j int) bool {
+		return statuses[i].Version < statuses[j].Version
+	})
+
 	return statuses, nil
 }
 
@@ -526,30 +593,59 @@ func (m *Migrator) Migrations() []Migration {
 	return copied
 }
 
-func (m *Migrator) getAppliedVersions(ctx context.Context) (map[int64]time.Time, error) {
-	rows, err := m.db.QueryContext(ctx, "SELECT version, applied_at FROM schema_migrations ORDER BY version ASC")
+type appliedRecord struct {
+	Version   int64
+	Name      string
+	AppliedAt time.Time
+}
+
+func (m *Migrator) getAppliedMigrations(ctx context.Context) (map[int64]appliedRecord, error) {
+	rows, err := m.db.QueryContext(ctx, "SELECT version, name, applied_at FROM schema_migrations ORDER BY version ASC")
 	if err != nil {
 		return nil, fmt.Errorf("failed to query schema_migrations: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
-	applied := make(map[int64]time.Time)
+	applied := make(map[int64]appliedRecord)
 	for rows.Next() {
 		var v int64
+		var name string
 		var rawAppliedAt any
-		if err := rows.Scan(&v, &rawAppliedAt); err != nil {
+		if err := rows.Scan(&v, &name, &rawAppliedAt); err != nil {
 			return nil, fmt.Errorf("failed to scan schema_migrations row: %w", err)
 		}
 		appliedAt, err := parseMigrationTime(rawAppliedAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse applied_at for migration %d: %w", v, err)
 		}
-		applied[v] = appliedAt
+		applied[v] = appliedRecord{
+			Version:   v,
+			Name:      name,
+			AppliedAt: appliedAt,
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error reading schema_migrations rows: %w", err)
 	}
 	return applied, nil
+}
+
+func (m *Migrator) validateAppliedMigrations(applied map[int64]appliedRecord) error {
+	known := make(map[int64]string, len(m.migrations))
+	for _, mig := range m.migrations {
+		known[mig.Version] = mig.Name
+	}
+
+	for ver, rec := range applied {
+		expectedName, exists := known[ver]
+		if !exists {
+			return fmt.Errorf("database contains unknown migration version %d (%s) not registered in this binary", ver, rec.Name)
+		}
+		if rec.Name != "" && rec.Name != expectedName {
+			return fmt.Errorf("database contains migration version %d with conflicting name %q (expected %q)", ver, rec.Name, expectedName)
+		}
+	}
+	return nil
 }
 
 func parseMigrationTime(val any) (time.Time, error) {

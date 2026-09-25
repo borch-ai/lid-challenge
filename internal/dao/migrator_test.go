@@ -3,6 +3,8 @@ package dao
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -285,6 +287,7 @@ func TestMigrator_Execution_Failures(t *testing.T) {
 	}
 
 	// 3. Faulty Down SQL
+	_, _ = db.ExecContext(ctx, "DELETE FROM schema_migrations; DROP TABLE IF EXISTS t1;")
 	faultyDownFS := fstest.MapFS{
 		"migrations/000001_faultydown.up.sql":   &fstest.MapFile{Data: []byte("CREATE TABLE t2(id INT);")},
 		"migrations/000001_faultydown.down.sql": &fstest.MapFile{Data: []byte("FAULTY SQL STATEMENT")},
@@ -627,5 +630,136 @@ func TestMigrator_Lock_And_BreakStaleLock(t *testing.T) {
 	_ = db.QueryRowContext(ctx, "SELECT is_locked FROM schema_migrations_lock WHERE id = 1").Scan(&isStillLocked)
 	if isStillLocked {
 		t.Errorf("expected unlock() to release lock, got true")
+	}
+}
+
+func TestMigrator_UnknownAndConflictingAppliedMigrations(t *testing.T) {
+	db, err := sql.Open("sqlite", "file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("failed to open sqlite database: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	ctx := context.Background()
+	m, err := NewMigrator(db, SQLiteDialect{})
+	if err != nil {
+		t.Fatalf("failed to create migrator: %v", err)
+	}
+	if err := m.EnsureTable(ctx); err != nil {
+		t.Fatalf("failed to ensure table: %v", err)
+	}
+
+	// 1. Insert an unknown future migration version (e.g. version 99)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err = db.ExecContext(ctx, "INSERT INTO schema_migrations (version, name, applied_at) VALUES (99, 'future_migration', ?)", now)
+	if err != nil {
+		t.Fatalf("failed to insert unknown migration: %v", err)
+	}
+
+	// Up must reject the unknown applied version
+	if _, err := m.Up(ctx); err == nil {
+		t.Errorf("expected Up to fail due to unknown applied version, got nil")
+	} else if !strings.Contains(err.Error(), "unknown migration version 99") {
+		t.Errorf("expected error to mention unknown migration version 99, got: %v", err)
+	}
+
+	// Down must also reject the unknown applied version
+	if _, err := m.Down(ctx, 1); err == nil {
+		t.Errorf("expected Down to fail due to unknown applied version, got nil")
+	} else if !strings.Contains(err.Error(), "unknown migration version 99") {
+		t.Errorf("expected error to mention unknown migration version 99, got: %v", err)
+	}
+
+	// Status should include the unknown migration marked as (unknown)
+	statuses, err := m.Status(ctx)
+	if err != nil {
+		t.Fatalf("Status failed: %v", err)
+	}
+	foundUnknown := false
+	for _, st := range statuses {
+		if st.Version == 99 && strings.Contains(st.Name, "(unknown)") && st.Applied {
+			foundUnknown = true
+			break
+		}
+	}
+	if !foundUnknown {
+		t.Errorf("expected Status to include unknown migration version 99, got: %+v", statuses)
+	}
+
+	// 2. Clear unknown migration and test conflicting name for known version (version 1)
+	_, _ = db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version = 99")
+	_, err = db.ExecContext(ctx, "INSERT INTO schema_migrations (version, name, applied_at) VALUES (1, 'wrong_name_for_v1', ?)", now)
+	if err != nil {
+		t.Fatalf("failed to insert conflicting migration name: %v", err)
+	}
+
+	if _, err := m.Up(ctx); err == nil {
+		t.Errorf("expected Up to fail due to conflicting migration name, got nil")
+	} else if !strings.Contains(err.Error(), "conflicting name") {
+		t.Errorf("expected error to mention conflicting name, got: %v", err)
+	}
+
+	if _, err := m.Down(ctx, 1); err == nil {
+		t.Errorf("expected Down to fail due to conflicting migration name, got nil")
+	} else if !strings.Contains(err.Error(), "conflicting name") {
+		t.Errorf("expected error to mention conflicting name, got: %v", err)
+	}
+}
+
+func TestMigrator_SQLite_ProcessLiveness_Lock(t *testing.T) {
+	db, err := sql.Open("sqlite", "file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("failed to open sqlite database: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	ctx := context.Background()
+	m, err := NewMigrator(db, SQLiteDialect{})
+	if err != nil {
+		t.Fatalf("failed to create migrator: %v", err)
+	}
+	if err := m.EnsureTable(ctx); err != nil {
+		t.Fatalf("failed to ensure table: %v", err)
+	}
+
+	// Test isProcessAlive helper
+	if !isProcessAlive(os.Getpid()) {
+		t.Errorf("expected current process to be alive")
+	}
+	if isProcessAlive(0) {
+		t.Errorf("expected PID 0 not to be considered alive")
+	}
+	if isProcessAlive(-1) {
+		t.Errorf("expected negative PID not to be alive")
+	}
+	if isProcessAlive(9999999) {
+		t.Errorf("expected non-existent PID 9999999 not to be alive")
+	}
+
+	// 1. Lock held by current PID on current host (active transaction simulation)
+	hostname, _ := os.Hostname()
+	aliveOwner := fmt.Sprintf("%s:%d:token1", hostname, os.Getpid())
+	staleTime := time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339Nano)
+	_, _ = db.ExecContext(ctx, "UPDATE schema_migrations_lock SET is_locked = 1, locked_at = ?, locked_by = ? WHERE id = 1", staleTime, aliveOwner)
+
+	// breakStaleLock must NOT reclaim the lock because the PID is alive on this host
+	m.breakStaleLock(ctx, time.Now().UTC())
+
+	var isLocked bool
+	_ = db.QueryRowContext(ctx, "SELECT is_locked FROM schema_migrations_lock WHERE id = 1").Scan(&isLocked)
+	if !isLocked {
+		t.Errorf("expected lock to remain held for alive local process, but it was reclaimed")
+	}
+
+	// 2. Lock held by dead PID on current host (crashed process simulation)
+	deadOwner := fmt.Sprintf("%s:9999999:token2", hostname)
+	_, _ = db.ExecContext(ctx, "UPDATE schema_migrations_lock SET is_locked = 1, locked_at = ?, locked_by = ? WHERE id = 1", staleTime, deadOwner)
+
+	// breakStaleLock MUST reclaim the lock because the PID is dead
+	m.breakStaleLock(ctx, time.Now().UTC())
+
+	_ = db.QueryRowContext(ctx, "SELECT is_locked FROM schema_migrations_lock WHERE id = 1").Scan(&isLocked)
+	if isLocked {
+		t.Errorf("expected lock to be broken for dead local process, but it remained locked")
 	}
 }

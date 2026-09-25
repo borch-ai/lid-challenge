@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path"
 	"sort"
 	"strconv"
@@ -163,7 +164,7 @@ func NewMigratorWithFS(db *sql.DB, dialect Dialect, fsys fs.FS, dir string) (*Mi
 	}, nil
 }
 
-// EnsureTable creates the schema_migrations tracking table if it does not already exist.
+// EnsureTable creates the schema_migrations and schema_migrations_lock tables if they do not already exist.
 func (m *Migrator) EnsureTable(ctx context.Context) error {
 	var ddl string
 	if m.dialect.Name() == "sqlite" {
@@ -172,20 +173,106 @@ func (m *Migrator) EnsureTable(ctx context.Context) error {
 			version BIGINT PRIMARY KEY,
 			name TEXT NOT NULL,
 			applied_at DATETIME NOT NULL
-		);`
+		);
+		CREATE TABLE IF NOT EXISTS schema_migrations_lock (
+			id INT PRIMARY KEY,
+			is_locked BOOLEAN NOT NULL DEFAULT 0,
+			locked_at DATETIME,
+			locked_by TEXT
+		);
+		INSERT OR IGNORE INTO schema_migrations_lock (id, is_locked) VALUES (1, 0);`
 	} else {
 		ddl = `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			version BIGINT PRIMARY KEY,
 			name VARCHAR(255) NOT NULL,
 			applied_at TIMESTAMPTZ NOT NULL
-		);`
+		);
+		CREATE TABLE IF NOT EXISTS schema_migrations_lock (
+			id INT PRIMARY KEY,
+			is_locked BOOLEAN NOT NULL DEFAULT FALSE,
+			locked_at TIMESTAMPTZ,
+			locked_by VARCHAR(255)
+		);
+		INSERT INTO schema_migrations_lock (id, is_locked) VALUES (1, FALSE) ON CONFLICT (id) DO NOTHING;`
 	}
-	_, err := m.db.ExecContext(ctx, ddl)
-	if err != nil {
-		return fmt.Errorf("failed to create schema_migrations table: %w", err)
+	var lastErr error
+	for attempt := 0; attempt < 50; attempt++ {
+		_, err := m.db.ExecContext(ctx, ddl)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if ctx.Err() != nil || errors.Is(err, sql.ErrConnDone) || strings.Contains(strings.ToLower(err.Error()), "closed") {
+			return fmt.Errorf("failed to create schema_migrations tables: %w", lastErr)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	return nil
+	return fmt.Errorf("failed to create schema_migrations tables: %w", lastErr)
+}
+
+// acquireLock acquires an exclusive distributed lock on schema_migrations_lock, retrying until ctx expires.
+func (m *Migrator) acquireLock(ctx context.Context) error {
+	hostname, _ := os.Hostname()
+	lockOwner := fmt.Sprintf("%s:%d", hostname, os.Getpid())
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	query := m.dialect.Rebind(`
+		UPDATE schema_migrations_lock
+		SET is_locked = TRUE, locked_at = ?, locked_by = ?
+		WHERE id = 1 AND is_locked = FALSE
+	`)
+
+	for {
+		now := time.Now().UTC()
+		var nowParam any = now
+		if m.dialect.Name() == "sqlite" {
+			nowParam = now.Format(time.RFC3339Nano)
+		}
+
+		res, err := m.db.ExecContext(ctx, query, nowParam, lockOwner)
+		if err == nil {
+			rows, _ := res.RowsAffected()
+			if rows == 1 {
+				return nil
+			}
+		}
+
+		// Break stale locks older than 2 minutes (e.g. from crashed containers)
+		m.breakStaleLock(ctx, now)
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timeout or canceled while waiting for migration lock: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+// releaseLock releases the exclusive distributed lock on schema_migrations_lock.
+func (m *Migrator) releaseLock(ctx context.Context) error {
+	query := `
+		UPDATE schema_migrations_lock
+		SET is_locked = FALSE, locked_at = NULL, locked_by = NULL
+		WHERE id = 1
+	`
+	_, err := m.db.ExecContext(ctx, query)
+	return err
+}
+
+func (m *Migrator) breakStaleLock(ctx context.Context, now time.Time) {
+	staleThreshold := now.Add(-2 * time.Minute)
+	var staleParam any = staleThreshold
+	if m.dialect.Name() == "sqlite" {
+		staleParam = staleThreshold.Format(time.RFC3339Nano)
+	}
+	query := m.dialect.Rebind(`
+		UPDATE schema_migrations_lock
+		SET is_locked = FALSE, locked_at = NULL, locked_by = NULL
+		WHERE id = 1 AND is_locked = TRUE AND locked_at < ?
+	`)
+	_, _ = m.db.ExecContext(ctx, query, staleParam)
 }
 
 func (m *Migrator) applyMigration(ctx context.Context, migration Migration) error {
@@ -245,11 +332,20 @@ func (m *Migrator) rollbackMigration(ctx context.Context, migration Migration) e
 	return nil
 }
 
-// Up executes all pending migrations in ascending order.
+// Up executes all pending migrations in ascending order, coordinated via distributed lock.
 func (m *Migrator) Up(ctx context.Context) (int, error) {
 	if err := m.EnsureTable(ctx); err != nil {
 		return 0, err
 	}
+
+	if err := m.acquireLock(ctx); err != nil {
+		return 0, fmt.Errorf("failed to acquire migration lock: %w", err)
+	}
+	defer func() {
+		relCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = m.releaseLock(relCtx)
+	}()
 
 	applied, err := m.getAppliedVersions(ctx)
 	if err != nil {
@@ -270,12 +366,21 @@ func (m *Migrator) Up(ctx context.Context) (int, error) {
 	return count, nil
 }
 
-// Down rolls back the specified number of applied migrations in descending order.
+// Down rolls back the specified number of applied migrations in descending order, coordinated via distributed lock.
 // If steps <= 0, exactly 1 migration is rolled back.
 func (m *Migrator) Down(ctx context.Context, steps int) (int, error) {
 	if err := m.EnsureTable(ctx); err != nil {
 		return 0, err
 	}
+
+	if err := m.acquireLock(ctx); err != nil {
+		return 0, fmt.Errorf("failed to acquire migration lock: %w", err)
+	}
+	defer func() {
+		relCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = m.releaseLock(relCtx)
+	}()
 
 	applied, err := m.getAppliedVersions(ctx)
 	if err != nil {

@@ -3,6 +3,7 @@ package dao
 import (
 	"context"
 	"database/sql"
+	"path/filepath"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -464,5 +465,110 @@ func TestParseMigrationTime(t *testing.T) {
 	// 5. Unsupported type
 	if _, err := parseMigrationTime(12345); err == nil {
 		t.Errorf("expected error for unsupported integer type, got nil")
+	}
+}
+
+func TestMigrator_ConcurrentUp_Coordination(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "concurrent_test.db")
+	baseDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open shared base db: %v", err)
+	}
+	defer func() { _ = baseDB.Close() }()
+
+	const numReplicas = 4
+	errChan := make(chan error, numReplicas)
+
+	for i := 0; i < numReplicas; i++ {
+		go func() {
+			db, err := sql.Open("sqlite", dbPath)
+			if err != nil {
+				errChan <- err
+				return
+			}
+			defer func() { _ = db.Close() }()
+
+			migrator, err := NewMigrator(db, SQLiteDialect{})
+			if err != nil {
+				errChan <- err
+				return
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			_, err = migrator.Up(ctx)
+			errChan <- err
+		}()
+	}
+
+	for i := 0; i < numReplicas; i++ {
+		if err := <-errChan; err != nil {
+			t.Fatalf("concurrent migration replica failed: %v", err)
+		}
+	}
+
+	m, err := NewMigrator(baseDB, SQLiteDialect{})
+	if err != nil {
+		t.Fatalf("failed to create verifier migrator: %v", err)
+	}
+	ver, err := m.Version(context.Background())
+	if err != nil {
+		t.Fatalf("failed to verify final version: %v", err)
+	}
+	if ver < 2 {
+		t.Errorf("expected final version >= 2, got %d", ver)
+	}
+}
+
+func TestMigrator_Lock_And_BreakStaleLock(t *testing.T) {
+	db, err := sql.Open("sqlite", "file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("failed to open sqlite database: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	ctx := context.Background()
+	m, err := NewMigrator(db, SQLiteDialect{})
+	if err != nil {
+		t.Fatalf("failed to create migrator: %v", err)
+	}
+
+	if err := m.EnsureTable(ctx); err != nil {
+		t.Fatalf("failed to ensure tables: %v", err)
+	}
+
+	// 1. Manually set stale lock (locked 10 minutes ago)
+	staleTime := time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339Nano)
+	_, err = db.ExecContext(ctx, "UPDATE schema_migrations_lock SET is_locked = 1, locked_at = ?, locked_by = 'crashed_pod' WHERE id = 1", staleTime)
+	if err != nil {
+		t.Fatalf("failed to insert stale lock: %v", err)
+	}
+
+	// breakStaleLock should clear it
+	m.breakStaleLock(ctx, time.Now().UTC())
+
+	var isLocked bool
+	err = db.QueryRowContext(ctx, "SELECT is_locked FROM schema_migrations_lock WHERE id = 1").Scan(&isLocked)
+	if err != nil {
+		t.Fatalf("failed to query lock state: %v", err)
+	}
+	if isLocked {
+		t.Errorf("expected stale lock to be broken (is_locked = false), got true")
+	}
+
+	// Also test breakStaleLock with PostgresDialect
+	pgM := &Migrator{db: db, dialect: PostgresDialect{}}
+	pgM.breakStaleLock(ctx, time.Now().UTC())
+
+	// 2. acquireLock with already-canceled context
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// Lock the table so acquireLock cannot immediately grab it
+	_, _ = db.ExecContext(ctx, "UPDATE schema_migrations_lock SET is_locked = 1, locked_at = ?, locked_by = 'holder' WHERE id = 1", time.Now().UTC().Format(time.RFC3339Nano))
+
+	if err := m.acquireLock(canceledCtx); err == nil {
+		t.Errorf("expected acquireLock to fail with canceled context, got nil")
 	}
 }

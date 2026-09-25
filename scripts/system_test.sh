@@ -24,6 +24,8 @@ fi
 RUN_ID="$(date +%s)_$RANDOM"
 TEST_DB="system_test_${RUN_ID}.db"
 SERVER_PID=""
+ACTUAL_DRIVER="${DB_DRIVER:-}"
+ACTUAL_DSN="${DB_DSN:-}"
 
 cleanup() {
   if [ -n "$SERVER_PID" ]; then
@@ -63,16 +65,17 @@ else
   echo "Compiling ./bin/lid-server from current source..."
   mkdir -p ./bin
   go build -o ./bin/lid-server ./cmd/server
-  ACTUAL_DRIVER="${DB_DRIVER:-sqlite}"
+  if [ -z "$ACTUAL_DRIVER" ]; then
+    ACTUAL_DRIVER="sqlite"
+  fi
   NORMALIZED_DRIVER="$(echo "$ACTUAL_DRIVER" | tr '[:upper:]' '[:lower:]' | xargs)"
-  if [ -n "${DB_DSN:-}" ]; then
+  if [ -n "$ACTUAL_DSN" ]; then
     ALLOW_MUTATING_TESTS="${ALLOW_MUTATING_TESTS:-false}"
     if [ "$ALLOW_MUTATING_TESTS" != "true" ]; then
       echo "Error: Custom DB_DSN supplied in isolated server mode."
       echo "To run tests against a custom database, explicitly set ALLOW_MUTATING_TESTS=true."
       exit 1
     fi
-    ACTUAL_DSN="$DB_DSN"
   elif [ "$NORMALIZED_DRIVER" = "sqlite" ] || [ "$NORMALIZED_DRIVER" = "sqlite3" ]; then
     ACTUAL_DSN="$TEST_DB"
   else
@@ -349,18 +352,23 @@ fi
 echo "PASS (HTTP 200) -> Pagination working as expected"
 
 # 13. Schema Migration CLI verification
-echo -n "13. Testing Schema Migration CLI (status & version)... "
-STATUS_OUT=$(APP_ENV="$APP_ENV" AUTH_SECRET="$AUTH_SECRET" DB_DRIVER="$ACTUAL_DRIVER" DB_DSN="$ACTUAL_DSN" ./bin/lid-server migrate status 2>&1)
-if ! echo "$STATUS_OUT" | grep -q "APPLIED"; then
-  echo "FAIL: expected applied migrations in status output: $STATUS_OUT"
-  exit 1
+if [ -n "${ACTUAL_DSN:-}" ]; then
+  echo -n "13. Testing Schema Migration CLI (status & version)... "
+  CLI_DRIVER="${ACTUAL_DRIVER:-sqlite}"
+  STATUS_OUT=$(APP_ENV="$APP_ENV" AUTH_SECRET="$AUTH_SECRET" DB_DRIVER="$CLI_DRIVER" DB_DSN="$ACTUAL_DSN" ./bin/lid-server migrate status 2>&1)
+  if ! echo "$STATUS_OUT" | grep -q "APPLIED"; then
+    echo "FAIL: expected applied migrations in status output: $STATUS_OUT"
+    exit 1
+  fi
+  VERSION_OUT=$(APP_ENV="$APP_ENV" AUTH_SECRET="$AUTH_SECRET" DB_DRIVER="$CLI_DRIVER" DB_DSN="$ACTUAL_DSN" ./bin/lid-server migrate version 2>&1)
+  if ! echo "$VERSION_OUT" | grep -q "Current schema version:"; then
+    echo "FAIL: expected version in version output: $VERSION_OUT"
+    exit 1
+  fi
+  echo "PASS -> Migration status and version verified"
+else
+  echo "13. Skipping Schema Migration CLI verification (USE_EXISTING_SERVER=true without local DB_DSN)."
 fi
-VERSION_OUT=$(APP_ENV="$APP_ENV" AUTH_SECRET="$AUTH_SECRET" DB_DRIVER="$ACTUAL_DRIVER" DB_DSN="$ACTUAL_DSN" ./bin/lid-server migrate version 2>&1)
-if ! echo "$VERSION_OUT" | grep -q "Current schema version:"; then
-  echo "FAIL: expected version in version output: $VERSION_OUT"
-  exit 1
-fi
-echo "PASS -> Migration status and version verified"
 
 echo "========================================="
 echo "✅ All Live System Tests Passed Successfully!"

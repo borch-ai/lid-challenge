@@ -250,3 +250,33 @@ func TestConfigLoad_TrustedProxies(t *testing.T) {
 		}
 	})
 }
+
+func TestLoadDBConfig(t *testing.T) {
+	// Set production env without AUTH_SECRET or vendor passwords
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("AUTH_SECRET", "")
+	t.Setenv("VENDOR_ABC_PASSWORD", "")
+	t.Setenv("VENDOR_XYZ_PASSWORD", "")
+	t.Setenv("DB_DRIVER", "postgres")
+	t.Setenv("DB_DSN", "postgres://test_user@localhost:5432/test_db?sslmode=disable")
+	t.Setenv("DEBUG", "true")
+	t.Setenv("MIGRATE_ON_STARTUP", "false")
+
+	dbCfg, err := LoadDBConfig()
+	if err != nil {
+		t.Fatalf("expected LoadDBConfig to succeed without app secrets, got: %v", err)
+	}
+
+	if dbCfg.Driver != "postgres" {
+		t.Errorf("expected driver 'postgres', got %q", dbCfg.Driver)
+	}
+	if dbCfg.DSN != "postgres://test_user@localhost:5432/test_db?sslmode=disable" {
+		t.Errorf("expected dsn 'postgres://test_user@localhost:5432/test_db?sslmode=disable', got %q", dbCfg.DSN)
+	}
+	if dbCfg.Debug != true {
+		t.Errorf("expected debug true, got %v", dbCfg.Debug)
+	}
+	if dbCfg.MigrateOnStartup != false {
+		t.Errorf("expected migrate on startup false, got %v", dbCfg.MigrateOnStartup)
+	}
+}

@@ -14,6 +14,29 @@ import (
 	"github.com/borch-ai/lid-challenge/internal/connector"
 )
 
+// DBConfig contains database connection parameters needed for database operations like migrations.
+type DBConfig struct {
+	Driver           string
+	DSN              string
+	Debug            bool
+	MigrateOnStartup bool
+}
+
+// LoadDBConfig loads only the database configuration parameters without requiring application or vendor secrets.
+func LoadDBConfig() (*DBConfig, error) {
+	driver := strings.ToLower(strings.TrimSpace(getEnv("DB_DRIVER", "sqlite")))
+	dsn := getEnv("DB_DSN", "lid.db")
+	debug := getEnvBool("DEBUG", false)
+	migrateOnStartup := getEnvBool("MIGRATE_ON_STARTUP", true)
+
+	return &DBConfig{
+		Driver:           driver,
+		DSN:              dsn,
+		Debug:            debug,
+		MigrateOnStartup: migrateOnStartup,
+	}, nil
+}
+
 // AppConfig contains all operational configuration parameters for the application.
 type AppConfig struct {
 	Server           api.Config

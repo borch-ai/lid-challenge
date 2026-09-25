@@ -19,7 +19,47 @@ import (
 	"github.com/borch-ai/lid-challenge/internal/dao"
 )
 
+func initUserDAO(driver, dsn string) (dao.UserDAO, error) {
+	switch strings.ToLower(strings.TrimSpace(driver)) {
+	case "sqlite", "sqlite3":
+		return dao.NewSQLiteDAO(dsn)
+	case "postgres", "postgresql", "cockroach", "cockroachdb":
+		return dao.NewPostgresDAO(dsn)
+	default:
+		return nil, fmt.Errorf("unsupported database driver: %s", driver)
+	}
+}
+
 func main() {
+	// Handle migration CLI command if requested (requires only DB credentials, no app/vendor secrets)
+	if len(os.Args) > 1 && (os.Args[1] == "migrate" || os.Args[1] == "--migrate") {
+		dbCfg, err := config.LoadDBConfig()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to load database configuration: %v\n", err)
+			os.Exit(1)
+		}
+
+		logLevel := slog.LevelInfo
+		if dbCfg.Debug {
+			logLevel = slog.LevelDebug
+		}
+		logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+			Level: logLevel,
+		}))
+
+		userDAO, err := initUserDAO(dbCfg.Driver, dbCfg.DSN)
+		if err != nil {
+			logger.Error("failed to connect to database", slog.Any("error", err))
+			os.Exit(1)
+		}
+		defer func() {
+			_ = userDAO.Close()
+		}()
+
+		runMigrationCLI(userDAO, os.Args[2:], logger)
+		return
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load configuration: %v\n", err)
@@ -40,16 +80,7 @@ func main() {
 	)
 
 	// Initialize database DAO based on driver
-	var userDAO dao.UserDAO
-	switch strings.ToLower(strings.TrimSpace(cfg.DBDriver)) {
-	case "sqlite", "sqlite3":
-		userDAO, err = dao.NewSQLiteDAO(cfg.DBDSN)
-	case "postgres", "postgresql", "cockroach", "cockroachdb":
-		userDAO, err = dao.NewPostgresDAO(cfg.DBDSN)
-	default:
-		logger.Error("unsupported database driver", slog.String("driver", cfg.DBDriver))
-		os.Exit(1)
-	}
+	userDAO, err := initUserDAO(cfg.DBDriver, cfg.DBDSN)
 	if err != nil {
 		logger.Error("failed to connect to database", slog.Any("error", err))
 		os.Exit(1)
@@ -57,12 +88,6 @@ func main() {
 	defer func() {
 		_ = userDAO.Close()
 	}()
-
-	// Handle migration CLI command if requested
-	if len(os.Args) > 1 && (os.Args[1] == "migrate" || os.Args[1] == "--migrate") {
-		runMigrationCLI(userDAO, os.Args[2:], logger)
-		return
-	}
 
 	// Execute migrations on startup if enabled
 	if cfg.MigrateOnStartup {
@@ -139,7 +164,11 @@ func runMigrationCLI(userDAO dao.UserDAO, args []string, logger *slog.Logger) {
 			logger.Error("migration up failed", slog.Any("error", err))
 			os.Exit(1)
 		}
-		ver, _ := migratable.MigrationVersion(ctx)
+		ver, err := migratable.MigrationVersion(ctx)
+		if err != nil {
+			logger.Error("failed to retrieve migration version after up", slog.Any("error", err))
+			os.Exit(1)
+		}
 		fmt.Printf("Successfully applied %d migration(s). Current version: %d\n", count, ver)
 
 	case "down":
@@ -157,7 +186,11 @@ func runMigrationCLI(userDAO dao.UserDAO, args []string, logger *slog.Logger) {
 			logger.Error("migration down failed", slog.Any("error", err))
 			os.Exit(1)
 		}
-		ver, _ := migratable.MigrationVersion(ctx)
+		ver, err := migratable.MigrationVersion(ctx)
+		if err != nil {
+			logger.Error("failed to retrieve migration version after down", slog.Any("error", err))
+			os.Exit(1)
+		}
 		fmt.Printf("Successfully rolled back %d migration(s). Current version: %d\n", count, ver)
 
 	case "status":

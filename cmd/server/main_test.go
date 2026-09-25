@@ -83,3 +83,17 @@ func TestRunMigrationCLI(t *testing.T) {
 		t.Errorf("expected usage output, got: %s", out)
 	}
 }
+
+func TestInitUserDAO(t *testing.T) {
+	// 1. SQLite
+	d1, err := initUserDAO("sqlite", "file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("expected sqlite init to succeed, got %v", err)
+	}
+	_ = d1.Close()
+
+	// 2. Unsupported
+	if _, err := initUserDAO("unsupported_driver", ""); err == nil {
+		t.Errorf("expected error for unsupported driver, got nil")
+	}
+}

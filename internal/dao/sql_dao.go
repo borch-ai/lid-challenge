@@ -77,17 +77,20 @@ func isUniqueViolation(err error) bool {
 		strings.Contains(errStr, "23505")
 }
 
-// SQLDAO implements UserDAO using Go standard database/sql with pluggable dialect support.
+// SQLDAO implements UserDAO and MigratableDAO using Go standard database/sql with pluggable dialect support.
 type SQLDAO struct {
-	db      *sql.DB
-	dialect Dialect
+	db       *sql.DB
+	dialect  Dialect
+	migrator *Migrator
 }
 
 // NewSQLDAO creates a new SQLDAO wrapping an existing *sql.DB and dialect.
 func NewSQLDAO(db *sql.DB, dialect Dialect) *SQLDAO {
+	migrator, _ := NewMigrator(db, dialect)
 	return &SQLDAO{
-		db:      db,
-		dialect: dialect,
+		db:       db,
+		dialect:  dialect,
+		migrator: migrator,
 	}
 }
 
@@ -149,14 +152,55 @@ func NewPostgresDAO(dsn string) (*SQLDAO, error) {
 	return NewSQLDAO(db, PostgresDialect{}), nil
 }
 
-// Migrate executes the schema DDL for the configured dialect.
+// Migrate executes the schema migrations for the configured dialect to bring the database to the latest version.
 func (s *SQLDAO) Migrate(ctx context.Context) error {
+	if s.migrator != nil {
+		_, err := s.migrator.Up(ctx)
+		return err
+	}
 	ddl := s.dialect.SchemaDDL()
 	_, err := s.db.ExecContext(ctx, ddl)
 	if err != nil {
 		return fmt.Errorf("failed to execute schema migration: %w", err)
 	}
 	return nil
+}
+
+// MigrateUp executes all pending database migrations in ascending order.
+func (s *SQLDAO) MigrateUp(ctx context.Context) (int, error) {
+	if s.migrator == nil {
+		return 0, errors.New("migrator is not initialized")
+	}
+	return s.migrator.Up(ctx)
+}
+
+// MigrateDown rolls back the specified number of applied migrations in descending order.
+func (s *SQLDAO) MigrateDown(ctx context.Context, steps int) (int, error) {
+	if s.migrator == nil {
+		return 0, errors.New("migrator is not initialized")
+	}
+	return s.migrator.Down(ctx, steps)
+}
+
+// MigrationVersion returns the highest applied migration version.
+func (s *SQLDAO) MigrationVersion(ctx context.Context) (int64, error) {
+	if s.migrator == nil {
+		return 0, errors.New("migrator is not initialized")
+	}
+	return s.migrator.Version(ctx)
+}
+
+// MigrationStatus returns status information for all registered migrations.
+func (s *SQLDAO) MigrationStatus(ctx context.Context) ([]MigrationStatus, error) {
+	if s.migrator == nil {
+		return nil, errors.New("migrator is not initialized")
+	}
+	return s.migrator.Status(ctx)
+}
+
+// Migrator returns the underlying Migrator instance.
+func (s *SQLDAO) Migrator() *Migrator {
+	return s.migrator
 }
 
 // Ping verifies connectivity to the underlying database pool.

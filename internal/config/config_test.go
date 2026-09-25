@@ -31,6 +31,9 @@ func TestConfigLoad_Defaults(t *testing.T) {
 	if cfg.Debug != false {
 		t.Errorf("expected default debug false, got %v", cfg.Debug)
 	}
+	if cfg.MigrateOnStartup != true {
+		t.Errorf("expected default migrate on startup true, got %v", cfg.MigrateOnStartup)
+	}
 }
 
 func TestConfigLoad_Overrides(t *testing.T) {
@@ -40,12 +43,16 @@ func TestConfigLoad_Overrides(t *testing.T) {
 	t.Setenv("DB_DRIVER", "postgres")
 	t.Setenv("RATE_LIMIT_RPS", "123.45")
 	t.Setenv("DEBUG", "true")
+	t.Setenv("MIGRATE_ON_STARTUP", "false")
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("unexpected error loading config: %v", err)
 	}
 
+	if cfg.MigrateOnStartup != false {
+		t.Errorf("expected migrate on startup false, got %v", cfg.MigrateOnStartup)
+	}
 	if cfg.Server.Port != 9090 {
 		t.Errorf("expected port 9090, got %d", cfg.Server.Port)
 	}

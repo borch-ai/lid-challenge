@@ -348,6 +348,20 @@ if [ "$COUNT" -ne 1 ]; then
 fi
 echo "PASS (HTTP 200) -> Pagination working as expected"
 
+# 13. Schema Migration CLI verification
+echo -n "13. Testing Schema Migration CLI (status & version)... "
+STATUS_OUT=$(APP_ENV="$APP_ENV" AUTH_SECRET="$AUTH_SECRET" DB_DRIVER="$ACTUAL_DRIVER" DB_DSN="$ACTUAL_DSN" ./bin/lid-server migrate status 2>&1)
+if ! echo "$STATUS_OUT" | grep -q "APPLIED"; then
+  echo "FAIL: expected applied migrations in status output: $STATUS_OUT"
+  exit 1
+fi
+VERSION_OUT=$(APP_ENV="$APP_ENV" AUTH_SECRET="$AUTH_SECRET" DB_DRIVER="$ACTUAL_DRIVER" DB_DSN="$ACTUAL_DSN" ./bin/lid-server migrate version 2>&1)
+if ! echo "$VERSION_OUT" | grep -q "Current schema version:"; then
+  echo "FAIL: expected version in version output: $VERSION_OUT"
+  exit 1
+fi
+echo "PASS -> Migration status and version verified"
+
 echo "========================================="
 echo "✅ All Live System Tests Passed Successfully!"
 echo "========================================="

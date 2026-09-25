@@ -48,6 +48,7 @@ func (d SQLiteDialect) SchemaDDL() string {
 	CREATE INDEX IF NOT EXISTS idx_user_profile_locality_lower ON user_profile(LOWER(locality));
 	CREATE INDEX IF NOT EXISTS idx_user_profile_region_lower ON user_profile(LOWER(region));
 	CREATE INDEX IF NOT EXISTS idx_user_profile_country_lower ON user_profile(LOWER(country));
+	CREATE INDEX IF NOT EXISTS idx_user_profile_created_at ON user_profile(created_at);
 
 	CREATE TABLE IF NOT EXISTS user_credential (
 		user_id TEXT PRIMARY KEY,
@@ -109,6 +110,7 @@ func (d PostgresDialect) SchemaDDL() string {
 	CREATE INDEX IF NOT EXISTS idx_user_profile_locality_lower ON user_profile((LOWER(locality)));
 	CREATE INDEX IF NOT EXISTS idx_user_profile_region_lower ON user_profile((LOWER(region)));
 	CREATE INDEX IF NOT EXISTS idx_user_profile_country_lower ON user_profile((LOWER(country)));
+	CREATE INDEX IF NOT EXISTS idx_user_profile_created_at ON user_profile(created_at);
 
 	CREATE TABLE IF NOT EXISTS user_credential (
 		user_id VARCHAR(64) PRIMARY KEY REFERENCES user_profile(id) ON DELETE CASCADE,

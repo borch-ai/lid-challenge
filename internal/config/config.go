@@ -16,10 +16,11 @@ import (
 
 // AppConfig contains all operational configuration parameters for the application.
 type AppConfig struct {
-	Server   api.Config
-	DBDriver string
-	DBDSN    string
-	Debug    bool
+	Server           api.Config
+	DBDriver         string
+	DBDSN            string
+	Debug            bool
+	MigrateOnStartup bool
 
 	VendorABC connector.VendorConfig
 	VendorXYZ connector.VendorConfig
@@ -98,6 +99,7 @@ func Load() (*AppConfig, error) {
 		}
 	}
 	debug := getEnvBool("DEBUG", false)
+	migrateOnStartup := getEnvBool("MIGRATE_ON_STARTUP", true)
 
 	cfg := &AppConfig{
 		Server: api.Config{
@@ -107,9 +109,10 @@ func Load() (*AppConfig, error) {
 			RateLimitBurst: rateLimitBurst,
 			TrustedProxies: trustedProxies,
 		},
-		DBDriver: dbDriver,
-		DBDSN:    dbDSN,
-		Debug:    debug,
+		DBDriver:         dbDriver,
+		DBDSN:            dbDSN,
+		Debug:            debug,
+		MigrateOnStartup: migrateOnStartup,
 
 		VendorABC: connector.VendorConfig{
 			ProviderName:    "ABC",

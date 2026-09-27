@@ -145,6 +145,8 @@ type mockErrorDAO struct {
 	migrateErr error
 	pingErr    error
 	closeErr   error
+	upCount    int
+	downCount  int
 }
 
 func (m *mockErrorDAO) CreateUser(ctx context.Context, profile *models.UserProfile, cred *models.UserCredential) (string, error) {
@@ -167,11 +169,11 @@ func (m *mockErrorDAO) Close() error {
 }
 
 func (m *mockErrorDAO) MigrateUp(ctx context.Context) (int, error) {
-	return 0, m.migrateErr
+	return m.upCount, m.migrateErr
 }
 
 func (m *mockErrorDAO) MigrateDown(ctx context.Context, steps int) (int, error) {
-	return 0, m.migrateErr
+	return m.downCount, m.migrateErr
 }
 
 func (m *mockErrorDAO) MigrationVersion(ctx context.Context) (int64, error) {
@@ -560,5 +562,32 @@ func TestRoutingDAO_ErrorDelegation(t *testing.T) {
 	r5, _ := NewRoutingDAO(PersistenceModeDualWrite, pFailClose, sFailClose, nil)
 	if err := r5.Close(); err == nil {
 		t.Error("expected error when both primary and secondary close fail")
+	}
+}
+
+func TestRoutingDAO_Migratable_AccumulatesCounts(t *testing.T) {
+	ctx := context.Background()
+	primary := &mockErrorDAO{upCount: 2, downCount: 1}
+	secondary := &mockErrorDAO{upCount: 3, downCount: 2}
+
+	r, err := NewRoutingDAO(PersistenceModeDualWrite, primary, secondary, nil)
+	if err != nil {
+		t.Fatalf("failed to create routing dao: %v", err)
+	}
+
+	upCount, err := r.MigrateUp(ctx)
+	if err != nil {
+		t.Fatalf("MigrateUp failed: %v", err)
+	}
+	if upCount != 5 {
+		t.Fatalf("expected upCount=5 (2+3), got %d", upCount)
+	}
+
+	downCount, err := r.MigrateDown(ctx, 1)
+	if err != nil {
+		t.Fatalf("MigrateDown failed: %v", err)
+	}
+	if downCount != 3 {
+		t.Fatalf("expected downCount=3 (1+2), got %d", downCount)
 	}
 }

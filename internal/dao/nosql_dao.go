@@ -61,6 +61,46 @@ type userDocument struct {
 	UpdatedAt  time.Time          `json:"updated_at"`
 }
 
+// nosqlFilePayload represents the on-disk JSON file structure containing
+// version metadata and the collection of user documents.
+type nosqlFilePayload struct {
+	Version   int64                    `json:"version"`
+	AppliedAt *time.Time               `json:"applied_at,omitempty"`
+	Documents map[string]*userDocument `json:"documents"`
+}
+
+func parseDocumentStoreFile(filePath string, data []byte) (map[string]*userDocument, int64, *time.Time, error) {
+	if len(data) == 0 {
+		return make(map[string]*userDocument), 0, nil, nil
+	}
+
+	// 1. Try structured payload containing version metadata and documents map
+	var payload nosqlFilePayload
+	if err := json.Unmarshal(data, &payload); err == nil && payload.Documents != nil {
+		for id, doc := range payload.Documents {
+			if doc == nil {
+				return nil, 0, nil, fmt.Errorf("document store file %q contains null document for user ID %q", filePath, id)
+			}
+		}
+		return payload.Documents, payload.Version, payload.AppliedAt, nil
+	}
+
+	// 2. Fallback to raw document map format
+	var rawDocs map[string]*userDocument
+	if err := json.Unmarshal(data, &rawDocs); err != nil {
+		return nil, 0, nil, fmt.Errorf("failed to unmarshal document store from %q: %w", filePath, err)
+	}
+	if rawDocs == nil {
+		return nil, 0, nil, fmt.Errorf("document store file %q decoded to null, expected document map", filePath)
+	}
+	for id, doc := range rawDocs {
+		if doc == nil {
+			return nil, 0, nil, fmt.Errorf("document store file %q contains null document for user ID %q", filePath, id)
+		}
+	}
+	return rawDocs, 0, nil, nil
+}
+
 // NoSQLDAO implements UserDAO using a document store pattern supporting both
 // in-memory mode (for tests and ephemeral workloads) and durable JSON file backing
 // with secondary index management and atomic single-document write semantics.
@@ -71,6 +111,7 @@ type NoSQLDAO struct {
 	byUsername map[string]string        // Unique secondary index: username -> user ID
 	closed     bool
 	migrated   bool
+	appliedAt  *time.Time
 }
 
 // NewNoSQLDAO creates a new NoSQLDAO document store instance.
@@ -96,23 +137,22 @@ func NewNoSQLDAO(dsn string) (*NoSQLDAO, error) {
 	if filePath != "" {
 		cleanPath := filepath.Clean(filePath)
 		// #nosec G304 -- administrative datastore file path configured via DSN
-		if data, err := os.ReadFile(cleanPath); err == nil && len(data) > 0 {
-			var loaded map[string]*userDocument
-			if err := json.Unmarshal(data, &loaded); err != nil {
-				return nil, fmt.Errorf("failed to unmarshal document store from %q: %w", filePath, err)
+		data, err := os.ReadFile(cleanPath)
+		if err == nil && len(data) > 0 {
+			loaded, ver, appliedAt, err := parseDocumentStoreFile(cleanPath, data)
+			if err != nil {
+				return nil, err
 			}
-			if loaded == nil {
-				return nil, fmt.Errorf("document store file %q decoded to null, expected document map", filePath)
+			dao.docs = loaded
+			if ver >= 1 {
+				dao.migrated = true
+				dao.appliedAt = appliedAt
 			}
 			for id, doc := range loaded {
-				if doc == nil {
-					return nil, fmt.Errorf("document store file %q contains null document for user ID %q", filePath, id)
-				}
-				if doc.Credential.Username != "" {
+				if doc != nil && doc.Credential.Username != "" {
 					dao.byUsername[doc.Credential.Username] = id
 				}
 			}
-			dao.docs = loaded
 		} else if err != nil && !os.IsNotExist(err) {
 			return nil, fmt.Errorf("failed to read document store file %q: %w", filePath, err)
 		}
@@ -130,25 +170,40 @@ func (d *NoSQLDAO) persistLocked() error {
 
 	// Reload and merge any existing documents on disk to prevent lost writes
 	// across processes or separate instances accessing the same file.
-	if diskData, err := os.ReadFile(cleanPath); err == nil && len(diskData) > 0 {
-		var diskDocs map[string]*userDocument
-		if err := json.Unmarshal(diskData, &diskDocs); err == nil {
-			for id, diskDoc := range diskDocs {
-				if diskDoc == nil {
-					continue
-				}
-				existing, exists := d.docs[id]
-				if !exists || diskDoc.UpdatedAt.After(existing.UpdatedAt) {
-					d.docs[id] = diskDoc
-					if diskDoc.Credential.Username != "" {
-						d.byUsername[diskDoc.Credential.Username] = id
-					}
+	diskData, err := os.ReadFile(cleanPath)
+	if err == nil && len(diskData) > 0 {
+		diskDocs, diskVer, diskAppliedAt, err := parseDocumentStoreFile(cleanPath, diskData)
+		if err != nil {
+			return fmt.Errorf("failed to reload document store file %q: %w", cleanPath, err)
+		}
+		for id, diskDoc := range diskDocs {
+			existing, exists := d.docs[id]
+			if !exists || diskDoc.UpdatedAt.After(existing.UpdatedAt) {
+				d.docs[id] = diskDoc
+				if diskDoc.Credential.Username != "" {
+					d.byUsername[diskDoc.Credential.Username] = id
 				}
 			}
 		}
+		if diskVer > 0 && !d.migrated {
+			d.migrated = true
+			d.appliedAt = diskAppliedAt
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to read document store file %q: %w", cleanPath, err)
 	}
 
-	data, err := json.MarshalIndent(d.docs, "", "  ")
+	var version int64
+	if d.migrated {
+		version = 1
+	}
+	payload := nosqlFilePayload{
+		Version:   version,
+		AppliedAt: d.appliedAt,
+		Documents: d.docs,
+	}
+
+	data, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal document store: %w", err)
 	}
@@ -215,12 +270,16 @@ func (d *NoSQLDAO) CreateUser(ctx context.Context, profile *models.UserProfile, 
 
 	profCopy := *profile
 	profCopy.ID = id
-	profCopy.CreatedAt = now
+	if profCopy.CreatedAt.IsZero() {
+		profCopy.CreatedAt = now
+	}
 	profCopy.UpdatedAt = now
 
 	credCopy := *cred
 	credCopy.UserID = id
-	credCopy.CreatedAt = now
+	if credCopy.CreatedAt.IsZero() {
+		credCopy.CreatedAt = now
+	}
 	credCopy.UpdatedAt = now
 
 	if credCopy.Method == "" {
@@ -414,7 +473,14 @@ func (d *NoSQLDAO) Migrate(ctx context.Context) error {
 		return errors.New("nosql dao is closed")
 	}
 
-	d.migrated = true
+	if !d.migrated {
+		d.migrated = true
+		now := time.Now().UTC()
+		d.appliedAt = &now
+		if err := d.persistLocked(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -436,6 +502,13 @@ func (d *NoSQLDAO) MigrateUp(ctx context.Context) (int, error) {
 	}
 
 	d.migrated = true
+	now := time.Now().UTC()
+	d.appliedAt = &now
+	if err := d.persistLocked(); err != nil {
+		d.migrated = false
+		d.appliedAt = nil
+		return 0, err
+	}
 	return 1, nil
 }
 
@@ -456,6 +529,13 @@ func (d *NoSQLDAO) MigrateDown(ctx context.Context, steps int) (int, error) {
 	}
 
 	d.migrated = false
+	prevAppliedAt := d.appliedAt
+	d.appliedAt = nil
+	if err := d.persistLocked(); err != nil {
+		d.migrated = true
+		d.appliedAt = prevAppliedAt
+		return 0, err
+	}
 	return 1, nil
 }
 
@@ -491,8 +571,13 @@ func (d *NoSQLDAO) MigrationStatus(ctx context.Context) ([]MigrationStatus, erro
 
 	var appliedAt *time.Time
 	if d.migrated {
-		now := time.Now().UTC()
-		appliedAt = &now
+		if d.appliedAt != nil {
+			tCopy := *d.appliedAt
+			appliedAt = &tCopy
+		} else {
+			now := time.Now().UTC()
+			appliedAt = &now
+		}
 	}
 
 	return []MigrationStatus{

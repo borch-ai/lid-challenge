@@ -369,9 +369,11 @@ func (r *RoutingDAO) MigrateUp(ctx context.Context) (int, error) {
 
 	if secondary != nil {
 		if m, ok := secondary.(MigratableDAO); ok {
-			if _, err := m.MigrateUp(ctx); err != nil {
+			secCount, err := m.MigrateUp(ctx)
+			if err != nil {
 				return count, fmt.Errorf("secondary datastore migrate up failed: %w", err)
 			}
+			count += secCount
 		}
 	}
 
@@ -395,9 +397,11 @@ func (r *RoutingDAO) MigrateDown(ctx context.Context, steps int) (int, error) {
 
 	if secondary != nil {
 		if m, ok := secondary.(MigratableDAO); ok {
-			if _, err := m.MigrateDown(ctx, steps); err != nil {
+			secCount, err := m.MigrateDown(ctx, steps)
+			if err != nil {
 				return count, fmt.Errorf("secondary datastore migrate down failed: %w", err)
 			}
+			count += secCount
 		}
 	}
 

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/borch-ai/lid-challenge/internal/models"
 	"github.com/borch-ai/lid-challenge/internal/security"
@@ -424,7 +425,55 @@ func TestNoSQLDAO_FilePersistence(t *testing.T) {
 		t.Fatalf("expected successful credential verification from reloaded disk file, got: %v, err: %v", authed, err)
 	}
 
-	// Phase 3: Reject null JSON decoded content
+	// Phase 3: Verify migration metadata persistence across restarts
+	if _, err := store2.MigrateUp(ctx); err != nil {
+		t.Fatalf("failed to migrate store2: %v", err)
+	}
+	_ = store2.Close()
+
+	storeMig, err := NewNoSQLDAO(storeFile)
+	if err != nil {
+		t.Fatalf("failed to reload file-backed store for migration check: %v", err)
+	}
+	defer func() { _ = storeMig.Close() }()
+
+	verMig, err := storeMig.MigrationVersion(ctx)
+	if err != nil || verMig != 1 {
+		t.Fatalf("expected reloaded migration version 1, got %d, err: %v", verMig, err)
+	}
+	statuses1, err := storeMig.MigrationStatus(ctx)
+	if err != nil || len(statuses1) == 0 || !statuses1[0].Applied || statuses1[0].AppliedAt == nil {
+		t.Fatalf("expected applied migration status after reload, got: %+v, err: %v", statuses1, err)
+	}
+	// Calling MigrationStatus again returns the same recorded timestamp
+	statuses2, _ := storeMig.MigrationStatus(ctx)
+	if !statuses1[0].AppliedAt.Equal(*statuses2[0].AppliedAt) {
+		t.Errorf("expected stable AppliedAt timestamp, got %v vs %v", statuses1[0].AppliedAt, statuses2[0].AppliedAt)
+	}
+
+	// Phase 4: Preserve caller-provided CreatedAt timestamp
+	customCreated := time.Date(2025, time.January, 15, 10, 0, 0, 0, time.UTC)
+	profCustom := &models.UserProfile{ID: "custom-created", Name: "Custom Time", Phone: "+1-555-0999", CreatedAt: customCreated}
+	credCustom := &models.UserCredential{Username: "custom_created", PasswordHash: hash, CreatedAt: customCreated}
+	if _, err := storeMig.CreateUser(ctx, profCustom, credCustom); err != nil {
+		t.Fatalf("failed to create user with custom created_at: %v", err)
+	}
+	fetchedCustom, err := storeMig.GetProfile(ctx, "custom-created")
+	if err != nil || !fetchedCustom.CreatedAt.Equal(customCreated) {
+		t.Errorf("expected preserved CreatedAt %v, got %v, err %v", customCreated, fetchedCustom.CreatedAt, err)
+	}
+
+	// Phase 5: Reject malformed file on reload in persistLocked without overwriting
+	if err := os.WriteFile(storeFile, []byte("{invalid-corrupt-json"), 0600); err != nil {
+		t.Fatalf("failed to corrupt file: %v", err)
+	}
+	profFail := &models.UserProfile{ID: "fail-doc", Name: "Fail", Phone: "+1-555-0000"}
+	credFail := &models.UserCredential{Username: "fail_doc", PasswordHash: hash}
+	if _, err := storeMig.CreateUser(ctx, profFail, credFail); err == nil {
+		t.Error("expected error writing when disk file is corrupted, got nil")
+	}
+
+	// Phase 6: Reject null JSON decoded content
 	nullFile := filepath.Join(tmpDir, "null.json")
 	if err := os.WriteFile(nullFile, []byte("null"), 0600); err != nil {
 		t.Fatalf("failed to write null file: %v", err)
@@ -433,7 +482,7 @@ func TestNoSQLDAO_FilePersistence(t *testing.T) {
 		t.Error("expected error loading JSON file decoding to null map, got nil")
 	}
 
-	// Phase 4: Reject null document entries within document map
+	// Phase 7: Reject null document entries within document map
 	nullDocFile := filepath.Join(tmpDir, "nulldoc.json")
 	if err := os.WriteFile(nullDocFile, []byte(`{"user1": null}`), 0600); err != nil {
 		t.Fatalf("failed to write nulldoc file: %v", err)

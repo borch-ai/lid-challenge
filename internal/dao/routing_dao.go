@@ -220,6 +220,15 @@ func (r *RoutingDAO) CreateUser(ctx context.Context, profile *models.UserProfile
 		credCopy := *cred
 		credCopy.UserID = id
 
+		// Propagate primary's normalized record (e.g. timestamps, hash method, generated ID)
+		// so both primary and secondary datastores stay identical across backends.
+		if primaryProfile, err := primary.GetProfile(ctx, id); err == nil && primaryProfile != nil {
+			profCopy = *primaryProfile
+		}
+		if primaryCred, err := primary.GetCredential(ctx, cred.Username); err == nil && primaryCred != nil {
+			credCopy = *primaryCred
+		}
+
 		if _, secErr := secondary.CreateUser(ctx, &profCopy, &credCopy); secErr != nil {
 			logger.Warn("secondary datastore replication write failed",
 				slog.String("operation", "CreateUser"),
@@ -236,52 +245,78 @@ func (r *RoutingDAO) CreateUser(ctx context.Context, profile *models.UserProfile
 	return id, nil
 }
 
-// GetProfile retrieves a user profile by unique user ID from the active primary datastore.
+// GetProfile retrieves a user profile by unique user ID from the active primary datastore,
+// falling back to SQL datastore if missing from NoSQL prior to historical data backfill.
 func (r *RoutingDAO) GetProfile(ctx context.Context, userID string) (*models.UserProfile, error) {
 	r.mu.RLock()
 	primary, _ := r.targets()
+	sqlFallback := r.sqlDAO
 	r.mu.RUnlock()
 
 	if primary == nil {
 		return nil, errors.New("no active primary datastore configured")
 	}
-	return primary.GetProfile(ctx, userID)
+	prof, err := primary.GetProfile(ctx, userID)
+	if errors.Is(err, ErrUserNotFound) && sqlFallback != nil && primary != sqlFallback {
+		return sqlFallback.GetProfile(ctx, userID)
+	}
+	return prof, err
 }
 
-// SearchProfiles finds user profiles matching search criteria using the active primary datastore.
+// SearchProfiles finds user profiles matching search criteria using the active primary datastore,
+// falling back to SQL datastore if no matches are found in NoSQL prior to historical data backfill.
 func (r *RoutingDAO) SearchProfiles(ctx context.Context, query models.SearchQuery) ([]*models.UserProfile, error) {
 	r.mu.RLock()
 	primary, _ := r.targets()
+	sqlFallback := r.sqlDAO
 	r.mu.RUnlock()
 
 	if primary == nil {
 		return nil, errors.New("no active primary datastore configured")
 	}
-	return primary.SearchProfiles(ctx, query)
+	results, err := primary.SearchProfiles(ctx, query)
+	if err == nil && len(results) == 0 && sqlFallback != nil && primary != sqlFallback {
+		return sqlFallback.SearchProfiles(ctx, query)
+	}
+	return results, err
 }
 
-// GetCredential retrieves user credential details by username from the active primary datastore.
+// GetCredential retrieves user credential details by username from the active primary datastore,
+// falling back to SQL datastore if missing from NoSQL prior to historical data backfill.
 func (r *RoutingDAO) GetCredential(ctx context.Context, username string) (*models.UserCredential, error) {
 	r.mu.RLock()
 	primary, _ := r.targets()
+	sqlFallback := r.sqlDAO
 	r.mu.RUnlock()
 
 	if primary == nil {
 		return nil, errors.New("no active primary datastore configured")
 	}
-	return primary.GetCredential(ctx, username)
+	cred, err := primary.GetCredential(ctx, username)
+	if errors.Is(err, ErrUserNotFound) && sqlFallback != nil && primary != sqlFallback {
+		return sqlFallback.GetCredential(ctx, username)
+	}
+	return cred, err
 }
 
-// VerifyUserCredential validates credentials against the active primary datastore.
+// VerifyUserCredential validates credentials against the active primary datastore,
+// falling back to SQL datastore if missing from NoSQL prior to historical data backfill.
 func (r *RoutingDAO) VerifyUserCredential(ctx context.Context, username, password string) (*models.UserProfile, error) {
 	r.mu.RLock()
 	primary, _ := r.targets()
+	sqlFallback := r.sqlDAO
 	r.mu.RUnlock()
 
 	if primary == nil {
 		return nil, errors.New("no active primary datastore configured")
 	}
-	return primary.VerifyUserCredential(ctx, username, password)
+	prof, err := primary.VerifyUserCredential(ctx, username, password)
+	if errors.Is(err, ErrUserNotFound) && sqlFallback != nil && primary != sqlFallback {
+		if fallbackProf, fallbackErr := sqlFallback.VerifyUserCredential(ctx, username, password); fallbackErr == nil {
+			return fallbackProf, nil
+		}
+	}
+	return prof, err
 }
 
 // Migrate executes migrations on both SQL and NoSQL datastores if configured.

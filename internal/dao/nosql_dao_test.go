@@ -660,3 +660,43 @@ func TestNoSQLDAO_ContextCancelledAndClosedErrors(t *testing.T) {
 		t.Error("expected error on closed GetCredential")
 	}
 }
+
+func TestNoSQLDAO_MalformedFileDSN(t *testing.T) {
+	for _, badDSN := range []string{"file://", "file://  ", "file://\t"} {
+		if _, err := NewNoSQLDAO(badDSN); err == nil {
+			t.Errorf("expected error for malformed file DSN %q, got nil", badDSN)
+		}
+	}
+}
+
+func TestNoSQLDAO_PingHealthCheck(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	// 1. Inaccessible directory
+	subDir := filepath.Join(tmpDir, "sub")
+	if err := os.Mkdir(subDir, 0700); err != nil {
+		t.Fatalf("failed to create subdir: %v", err)
+	}
+	filePath := filepath.Join(subDir, "health.json")
+	storeFile, err := NewNoSQLDAO(filePath)
+	if err != nil {
+		t.Fatalf("unexpected error creating DAO pointing to file: %v", err)
+	}
+	if err := storeFile.Ping(ctx); err != nil {
+		t.Errorf("expected successful Ping for valid file path, got: %v", err)
+	}
+
+	// Remove subdir to make path inaccessible
+	_ = os.RemoveAll(subDir)
+	if err := storeFile.Ping(ctx); err == nil {
+		t.Error("expected Ping error when parent directory is removed, got nil")
+	}
+
+	// 2. Closed store
+	_ = storeFile.Close()
+	if err := storeFile.Ping(ctx); err == nil {
+		t.Error("expected error on Ping for closed store, got nil")
+	}
+}
+

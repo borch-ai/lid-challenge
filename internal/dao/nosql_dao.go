@@ -136,7 +136,14 @@ func NewNoSQLDAO(dsn string) (*NoSQLDAO, error) {
 	trimmed := strings.TrimSpace(dsn)
 	var filePath string
 	if trimmed != "" && trimmed != "memory" && trimmed != ":memory:" && !strings.HasPrefix(trimmed, "memory://") {
-		filePath = strings.TrimPrefix(trimmed, "file://")
+		if strings.HasPrefix(trimmed, "file://") {
+			filePath = strings.TrimPrefix(trimmed, "file://")
+			if strings.TrimSpace(filePath) == "" {
+				return nil, fmt.Errorf("invalid file DSN %q: empty file path", dsn)
+			}
+		} else {
+			filePath = trimmed
+		}
 	}
 
 	dao := &NoSQLDAO{
@@ -626,6 +633,22 @@ func (d *NoSQLDAO) Ping(ctx context.Context) error {
 
 	if d.closed {
 		return errors.New("nosql dao is closed")
+	}
+
+	if d.filePath != "" {
+		cleanPath := filepath.Clean(d.filePath)
+		if info, err := os.Stat(cleanPath); err == nil {
+			if info.IsDir() {
+				return fmt.Errorf("configured document store path %q is a directory, expected a file", cleanPath)
+			}
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("document store file %q inaccessible: %w", cleanPath, err)
+		} else {
+			dir := filepath.Dir(cleanPath)
+			if _, err := os.Stat(dir); err != nil {
+				return fmt.Errorf("document store directory %q inaccessible: %w", dir, err)
+			}
+		}
 	}
 	return nil
 }

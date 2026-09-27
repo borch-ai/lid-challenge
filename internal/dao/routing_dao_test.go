@@ -620,3 +620,108 @@ func TestRoutingDAO_Migratable_StandaloneWithSecondary(t *testing.T) {
 	}
 }
 
+func TestRoutingDAO_SQLFallback_WhenNoSQLPrimaryMissingRecord(t *testing.T) {
+	ctx := context.Background()
+	sqlDAO, err := NewSQLiteDAO("file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("failed to create sqlite dao: %v", err)
+	}
+	defer func() { _ = sqlDAO.Close() }()
+	if err := sqlDAO.Migrate(ctx); err != nil {
+		t.Fatalf("failed to migrate sqlite: %v", err)
+	}
+
+	nosqlDAO, err := NewNoSQLDAO("")
+	if err != nil {
+		t.Fatalf("failed to create nosql dao: %v", err)
+	}
+	defer func() { _ = nosqlDAO.Close() }()
+
+	// Pre-create user in SQL only (simulating pre-existing data created prior to cutover)
+	hash, _ := security.HashPassword("sqlpass")
+	pSQL := &models.UserProfile{Name: "PreExisting User", Phone: "+1-555-0999"}
+	cSQL := &models.UserCredential{Username: "preexisting_user", PasswordHash: hash}
+	userID, err := sqlDAO.CreateUser(ctx, pSQL, cSQL)
+	if err != nil {
+		t.Fatalf("failed to create user in SQL: %v", err)
+	}
+
+	// Router operating with NoSQL primary and SQL fallback
+	r, err := NewRoutingDAO(PersistenceModeDualWriteNoSQLPrimary, sqlDAO, nosqlDAO, nil)
+	if err != nil {
+		t.Fatalf("failed to create routing dao: %v", err)
+	}
+
+	// 1. GetProfile falls back to SQL
+	prof, err := r.GetProfile(ctx, userID)
+	if err != nil || prof.Name != "PreExisting User" {
+		t.Errorf("expected SQL fallback for GetProfile, got prof %+v, err %v", prof, err)
+	}
+
+	// 2. GetCredential falls back to SQL
+	cred, err := r.GetCredential(ctx, "preexisting_user")
+	if err != nil || cred.UserID != userID {
+		t.Errorf("expected SQL fallback for GetCredential, got cred %+v, err %v", cred, err)
+	}
+
+	// 3. VerifyUserCredential falls back to SQL
+	authProf, err := r.VerifyUserCredential(ctx, "preexisting_user", "sqlpass")
+	if err != nil || authProf.ID != userID {
+		t.Errorf("expected SQL fallback for VerifyUserCredential, got %+v, err %v", authProf, err)
+	}
+
+	// 4. SearchProfiles falls back to SQL
+	results, err := r.SearchProfiles(ctx, models.SearchQuery{Name: "PreExisting"})
+	if err != nil || len(results) != 1 || results[0].ID != userID {
+		t.Errorf("expected SQL fallback for SearchProfiles, got %+v, err %v", results, err)
+	}
+}
+
+func TestRoutingDAO_NormalizedReplication_NoSQLPrimary(t *testing.T) {
+	ctx := context.Background()
+	sqlDAO, err := NewSQLiteDAO("file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("failed to create sqlite dao: %v", err)
+	}
+	defer func() { _ = sqlDAO.Close() }()
+	if err := sqlDAO.Migrate(ctx); err != nil {
+		t.Fatalf("failed to migrate sqlite: %v", err)
+	}
+
+	nosqlDAO, err := NewNoSQLDAO("")
+	if err != nil {
+		t.Fatalf("failed to create nosql dao: %v", err)
+	}
+	defer func() { _ = nosqlDAO.Close() }()
+
+	r, err := NewRoutingDAO(PersistenceModeDualWriteNoSQLPrimary, sqlDAO, nosqlDAO, nil)
+	if err != nil {
+		t.Fatalf("failed to create routing dao: %v", err)
+	}
+
+	hash, _ := security.HashPassword("normpass")
+	p := &models.UserProfile{Name: "Norm User", Phone: "+1-555-0888"}
+	c := &models.UserCredential{Username: "norm_user", PasswordHash: hash}
+
+	id, err := r.CreateUser(ctx, p, c)
+	if err != nil {
+		t.Fatalf("failed to create user: %v", err)
+	}
+
+	// Fetch from primary (NoSQL) and secondary (SQL)
+	pNoSQL, err := nosqlDAO.GetProfile(ctx, id)
+	if err != nil {
+		t.Fatalf("failed to get from primary: %v", err)
+	}
+	pSQL, err := sqlDAO.GetProfile(ctx, id)
+	if err != nil {
+		t.Fatalf("failed to get from secondary: %v", err)
+	}
+
+	// Timestamps must match exactly between primary and secondary
+	if !pNoSQL.CreatedAt.Equal(pSQL.CreatedAt) {
+		t.Errorf("expected matching CreatedAt timestamps, got NoSQL %v vs SQL %v", pNoSQL.CreatedAt, pSQL.CreatedAt)
+	}
+}
+
+

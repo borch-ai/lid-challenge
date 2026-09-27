@@ -222,8 +222,8 @@ func TestNoSQLDAO_CreateAndRetrieve(t *testing.T) {
 	if _, err := store.GetProfile(ctx, "nonexistent"); !errors.Is(err, ErrUserNotFound) {
 		t.Errorf("expected ErrUserNotFound, got %v", err)
 	}
-	if _, err := store.GetProfile(ctx, ""); !errors.Is(err, ErrUserNotFound) {
-		t.Errorf("expected ErrUserNotFound for empty ID, got %v", err)
+	if _, err := store.GetProfile(ctx, ""); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput for empty ID, got %v", err)
 	}
 
 	// GetCredential tests
@@ -572,6 +572,50 @@ func TestNoSQLDAO_FilePersistence(t *testing.T) {
 	// Another local write triggers reload and must detect username collision with local1
 	if _, err := reloadStore.CreateUser(ctx, &models.UserProfile{ID: "local2", Name: "Local 2", Phone: "333"}, &models.UserCredential{Username: "local2", PasswordHash: hash}); err == nil {
 		t.Error("expected error when disk reload introduces duplicate username for another ID, got nil")
+	}
+
+	// Phase 11: Verify replaced document's old username is removed from index on reload
+	updateUserJSON := `{
+		"user1": {"id": "user1", "profile": {"name": "U1", "phone": "123"}, "credential": {"username": "new_alice", "password_hash": "h1"}, "updated_at": "2099-01-01T00:00:00Z"}
+	}`
+	if err := os.WriteFile(diskReloadFile, []byte(updateUserJSON), 0600); err != nil {
+		t.Fatalf("failed to write updateUserJSON: %v", err)
+	}
+	reloadStore2, err := NewNoSQLDAO(diskReloadFile)
+	if err != nil {
+		t.Fatalf("failed to open reload store 2: %v", err)
+	}
+	defer func() { _ = reloadStore2.Close() }()
+	// "unique1" was replaced by "new_alice" for user1; old username must no longer resolve
+	if _, err := reloadStore2.GetCredential(ctx, "unique1"); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("expected ErrUserNotFound for replaced username, got %v", err)
+	}
+	if cred, err := reloadStore2.GetCredential(ctx, "new_alice"); err != nil || cred.UserID != "user1" {
+		t.Errorf("expected new_alice to resolve to user1, got cred %v, err %v", cred, err)
+	}
+
+	// Phase 12: Preserving caller-provided ID without trimming
+	untrimmedID := "  untrimmed-id  "
+	pUntrimmed := &models.UserProfile{ID: untrimmedID, Name: "Untrimmed", Phone: "123"}
+	cUntrimmed := &models.UserCredential{Username: "untrimmed_user", PasswordHash: hash}
+	returnedID, err := reloadStore2.CreateUser(ctx, pUntrimmed, cUntrimmed)
+	if err != nil {
+		t.Fatalf("failed to create user with untrimmed ID: %v", err)
+	}
+	if returnedID != untrimmedID {
+		t.Errorf("expected preserved ID %q, got %q", untrimmedID, returnedID)
+	}
+	profFetched, err := reloadStore2.GetProfile(ctx, untrimmedID)
+	if err != nil || profFetched.ID != untrimmedID {
+		t.Errorf("expected profile with ID %q, got %+v, err %v", untrimmedID, profFetched, err)
+	}
+
+	// Phase 13: Blank user ID in GetProfile returns ErrInvalidInput
+	if _, err := reloadStore2.GetProfile(ctx, ""); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput for empty userID in GetProfile, got: %v", err)
+	}
+	if _, err := reloadStore2.GetProfile(ctx, "   "); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput for whitespace-only userID in GetProfile, got: %v", err)
 	}
 }
 

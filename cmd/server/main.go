@@ -83,12 +83,28 @@ func buildRoutingDAO(mode dao.PersistenceMode, driver1 string, dao1 dao.UserDAO,
 	if err := validatePersistenceConfig(string(mode), driver1, driver2); err != nil {
 		return nil, err
 	}
-	if isNoSQLDriver(driver1) && !isNoSQLDriver(driver2) {
-		// driver1 is NoSQL, driver2 is SQL
+	switch mode {
+	case dao.PersistenceModeSQLOnly:
+		var nosqlDAO dao.UserDAO
+		if driver2 != "" && isNoSQLDriver(driver2) {
+			nosqlDAO = dao2
+		}
+		return dao.NewRoutingDAO(mode, dao1, nosqlDAO, logger)
+	case dao.PersistenceModeNoSQLOnly:
+		var sqlDAO dao.UserDAO
+		if driver2 != "" && !isNoSQLDriver(driver2) {
+			sqlDAO = dao2
+		}
+		return dao.NewRoutingDAO(mode, sqlDAO, dao1, logger)
+	case dao.PersistenceModeDualWrite:
+		// driver1 is SQL (primary), driver2 is NoSQL (secondary)
+		return dao.NewRoutingDAO(mode, dao1, dao2, logger)
+	case dao.PersistenceModeDualWriteNoSQLPrimary:
+		// driver1 is NoSQL (primary), driver2 is SQL (secondary)
 		return dao.NewRoutingDAO(mode, dao2, dao1, logger)
+	default:
+		return nil, fmt.Errorf("unsupported persistence mode: %s", mode)
 	}
-	// driver1 is SQL, driver2 is NoSQL
-	return dao.NewRoutingDAO(mode, dao1, dao2, logger)
 }
 
 func main() {

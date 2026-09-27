@@ -155,6 +155,25 @@ func TestBuildRoutingDAO(t *testing.T) {
 	if _, err := buildRoutingDAO(dao.PersistenceModeDualWrite, "nosql", nosqlDAO, "memory", nosqlDAO, nil); err == nil {
 		t.Errorf("expected error when both drivers are NoSQL, got nil")
 	}
+
+	// Standalone mode: nosql_only with secondary nosql driver (primary must be dao1)
+	memDAO, _ := dao.NewNoSQLDAO("memory")
+	rNoSQLStandalone, err := buildRoutingDAO(dao.PersistenceModeNoSQLOnly, "nosql", nosqlDAO, "memory", memDAO, nil)
+	if err != nil {
+		t.Fatalf("failed buildRoutingDAO for nosql_only with secondary: %v", err)
+	}
+	if rNoSQLStandalone.NoSQLDAO() != nosqlDAO {
+		t.Errorf("expected primary nosqlDAO to be retained in nosql_only mode, got secondary")
+	}
+
+	// Standalone mode: sql_only with secondary nosql driver
+	rSQLStandalone, err := buildRoutingDAO(dao.PersistenceModeSQLOnly, "sqlite", sqliteDAO, "nosql", nosqlDAO, nil)
+	if err != nil {
+		t.Fatalf("failed buildRoutingDAO for sql_only with secondary: %v", err)
+	}
+	if rSQLStandalone.SQLDAO() != sqliteDAO {
+		t.Errorf("expected primary sqlDAO to be retained in sql_only mode")
+	}
 }
 
 func TestValidatePersistenceConfig(t *testing.T) {

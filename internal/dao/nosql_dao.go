@@ -194,6 +194,9 @@ func (d *NoSQLDAO) persistLocked() error {
 		for id, diskDoc := range diskDocs {
 			existing, exists := d.docs[id]
 			if !exists || diskDoc.UpdatedAt.After(existing.UpdatedAt) {
+				if exists && existing.Credential.Username != "" && existing.Credential.Username != diskDoc.Credential.Username {
+					delete(d.byUsername, existing.Credential.Username)
+				}
 				if diskDoc.Credential.Username != "" {
 					if existingID, ok := d.byUsername[diskDoc.Credential.Username]; ok && existingID != id {
 						return fmt.Errorf("reload document store file %q detected duplicate username %q for user IDs %q and %q", cleanPath, diskDoc.Credential.Username, existingID, id)
@@ -275,7 +278,7 @@ func (d *NoSQLDAO) CreateUser(ctx context.Context, profile *models.UserProfile, 
 		return "", ErrUsernameTaken
 	}
 
-	id := strings.TrimSpace(profile.ID)
+	id := profile.ID
 	if id != "" {
 		// Reject duplicate caller-supplied IDs to prevent corrupting indices
 		if _, exists := d.docs[id]; exists {
@@ -332,7 +335,7 @@ func (d *NoSQLDAO) GetProfile(ctx context.Context, userID string) (*models.UserP
 		return nil, err
 	}
 	if strings.TrimSpace(userID) == "" {
-		return nil, ErrUserNotFound
+		return nil, ErrInvalidInput
 	}
 
 	d.mu.RLock()
@@ -456,6 +459,9 @@ func (d *NoSQLDAO) GetCredential(ctx context.Context, username string) (*models.
 	}
 
 	cred := doc.Credential.toModel()
+	if cred.UserID == "" {
+		cred.UserID = doc.ID
+	}
 	return &cred, nil
 }
 

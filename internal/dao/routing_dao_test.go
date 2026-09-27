@@ -591,3 +591,32 @@ func TestRoutingDAO_Migratable_AccumulatesCounts(t *testing.T) {
 		t.Fatalf("expected downCount=3 (1+2), got %d", downCount)
 	}
 }
+
+func TestRoutingDAO_Migratable_StandaloneWithSecondary(t *testing.T) {
+	ctx := context.Background()
+	sqlPrimary := &mockErrorDAO{upCount: 1, downCount: 1}
+	nosqlSecondary := &mockErrorDAO{upCount: 2, downCount: 2}
+
+	// In SQL-only mode with a secondary NoSQL datastore configured
+	r, err := NewRoutingDAO(PersistenceModeSQLOnly, sqlPrimary, nosqlSecondary, nil)
+	if err != nil {
+		t.Fatalf("failed to create routing dao: %v", err)
+	}
+
+	upCount, err := r.MigrateUp(ctx)
+	if err != nil {
+		t.Fatalf("MigrateUp failed: %v", err)
+	}
+	if upCount != 3 {
+		t.Fatalf("expected upCount=3 (1+2) migrating both configured datastores in standalone mode, got %d", upCount)
+	}
+
+	downCount, err := r.MigrateDown(ctx, 1)
+	if err != nil {
+		t.Fatalf("MigrateDown failed: %v", err)
+	}
+	if downCount != 3 {
+		t.Fatalf("expected downCount=3 (1+2), got %d", downCount)
+	}
+}
+

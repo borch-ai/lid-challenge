@@ -297,7 +297,7 @@ func (r *RoutingDAO) Migrate(ctx context.Context) error {
 		}
 	}
 
-	if nosqlDAO != nil {
+	if nosqlDAO != nil && nosqlDAO != sqlDAO {
 		if err := nosqlDAO.Migrate(ctx); err != nil {
 			return fmt.Errorf("nosql datastore migration failed: %w", err)
 		}
@@ -319,7 +319,7 @@ func (r *RoutingDAO) Ping(ctx context.Context) error {
 		}
 	}
 
-	if nosqlDAO != nil {
+	if nosqlDAO != nil && nosqlDAO != sqlDAO {
 		if err := nosqlDAO.Ping(ctx); err != nil {
 			return fmt.Errorf("nosql datastore ping failed: %w", err)
 		}
@@ -340,7 +340,7 @@ func (r *RoutingDAO) Close() error {
 		}
 	}
 
-	if r.nosqlDAO != nil {
+	if r.nosqlDAO != nil && r.nosqlDAO != r.sqlDAO {
 		if err := r.nosqlDAO.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("failed to close nosql datastore: %w", err))
 		}
@@ -352,60 +352,50 @@ func (r *RoutingDAO) Close() error {
 	return nil
 }
 
-// MigrateUp executes pending migrations on the active primary and secondary datastores.
-func (r *RoutingDAO) MigrateUp(ctx context.Context) (int, error) {
+func (r *RoutingDAO) migratables() []MigratableDAO {
+	var migratables []MigratableDAO
+	seen := make(map[UserDAO]bool)
+
 	r.mu.RLock()
 	primary, secondary := r.targets()
+	candidates := []UserDAO{primary, secondary, r.sqlDAO, r.nosqlDAO}
 	r.mu.RUnlock()
 
-	var count int
-	if m, ok := primary.(MigratableDAO); ok {
-		var err error
-		count, err = m.MigrateUp(ctx)
-		if err != nil {
-			return count, fmt.Errorf("primary datastore migrate up failed: %w", err)
-		}
-	}
-
-	if secondary != nil {
-		if m, ok := secondary.(MigratableDAO); ok {
-			secCount, err := m.MigrateUp(ctx)
-			if err != nil {
-				return count, fmt.Errorf("secondary datastore migrate up failed: %w", err)
+	for _, cand := range candidates {
+		if cand != nil && !seen[cand] {
+			seen[cand] = true
+			if m, ok := cand.(MigratableDAO); ok {
+				migratables = append(migratables, m)
 			}
-			count += secCount
 		}
 	}
-
-	return count, nil
+	return migratables
 }
 
-// MigrateDown rolls back migrations on both the active primary and secondary datastores.
-func (r *RoutingDAO) MigrateDown(ctx context.Context, steps int) (int, error) {
-	r.mu.RLock()
-	primary, secondary := r.targets()
-	r.mu.RUnlock()
-
-	var count int
-	if m, ok := primary.(MigratableDAO); ok {
-		var err error
-		count, err = m.MigrateDown(ctx, steps)
+// MigrateUp executes pending migrations on all configured datastores.
+func (r *RoutingDAO) MigrateUp(ctx context.Context) (int, error) {
+	var totalCount int
+	for _, m := range r.migratables() {
+		count, err := m.MigrateUp(ctx)
 		if err != nil {
-			return count, err
+			return totalCount, err
 		}
+		totalCount += count
 	}
+	return totalCount, nil
+}
 
-	if secondary != nil {
-		if m, ok := secondary.(MigratableDAO); ok {
-			secCount, err := m.MigrateDown(ctx, steps)
-			if err != nil {
-				return count, fmt.Errorf("secondary datastore migrate down failed: %w", err)
-			}
-			count += secCount
+// MigrateDown rolls back migrations on all configured datastores.
+func (r *RoutingDAO) MigrateDown(ctx context.Context, steps int) (int, error) {
+	var totalCount int
+	for _, m := range r.migratables() {
+		count, err := m.MigrateDown(ctx, steps)
+		if err != nil {
+			return totalCount, err
 		}
+		totalCount += count
 	}
-
-	return count, nil
+	return totalCount, nil
 }
 
 // MigrationVersion returns the schema version of the active primary datastore.

@@ -36,7 +36,7 @@ type UserDAO interface {
 	// returning the associated UserProfile upon successful authentication.
 	VerifyUserCredential(ctx context.Context, username, password string) (*models.UserProfile, error)
 
-	// Migrate executes dialect-specific DDL to initialize database tables and indexes.
+	// Migrate executes dialect-specific migrations to bring the database schema to the latest version.
 	Migrate(ctx context.Context) error
 
 	// Ping verifies connectivity to the underlying database engine.
@@ -44,4 +44,21 @@ type UserDAO interface {
 
 	// Close releases any database connections and resources.
 	Close() error
+}
+
+// MigratableDAO extends UserDAO with granular migration lifecycle controls.
+type MigratableDAO interface {
+	UserDAO
+
+	// MigrateUp executes all pending database migrations in ascending order.
+	MigrateUp(ctx context.Context) (int, error)
+
+	// MigrateDown rolls back the specified number of applied migrations in descending order.
+	MigrateDown(ctx context.Context, steps int) (int, error)
+
+	// MigrationVersion returns the highest applied migration version.
+	MigrationVersion(ctx context.Context) (int64, error)
+
+	// MigrationStatus returns status information for all registered migrations.
+	MigrationStatus(ctx context.Context) ([]MigrationStatus, error)
 }

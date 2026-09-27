@@ -77,21 +77,32 @@ func isUniqueViolation(err error) bool {
 		strings.Contains(errStr, "23505")
 }
 
-// SQLDAO implements UserDAO using Go standard database/sql with pluggable dialect support.
+// SQLDAO implements UserDAO and MigratableDAO using Go standard database/sql with pluggable dialect support.
 type SQLDAO struct {
-	db      *sql.DB
-	dialect Dialect
+	db       *sql.DB
+	dialect  Dialect
+	migrator *Migrator
 }
 
 // NewSQLDAO creates a new SQLDAO wrapping an existing *sql.DB and dialect.
-func NewSQLDAO(db *sql.DB, dialect Dialect) *SQLDAO {
-	return &SQLDAO{
-		db:      db,
-		dialect: dialect,
+// It initializes an embedded schema Migrator and returns an error if migrator initialization fails.
+func NewSQLDAO(db *sql.DB, dialect Dialect) (*SQLDAO, error) {
+	migrator, err := NewMigrator(db, dialect)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize migrator: %w", err)
 	}
+	return &SQLDAO{
+		db:       db,
+		dialect:  dialect,
+		migrator: migrator,
+	}, nil
 }
 
 // NewSQLiteDAO connects to a SQLite database and initializes the DAO.
+// Note: SQLite uses a single connection pool (SetMaxOpenConns(1)) to prevent database locking
+// contention. Concurrent schema migrations across distinct hosts or containers sharing a SQLite
+// file over a network filesystem are unsupported; migration locking relies on host-local process
+// liveness verification.
 func NewSQLiteDAO(dsn string) (*SQLDAO, error) {
 	if dsn == "" {
 		dsn = fmt.Sprintf("file:mem_%s?mode=memory&cache=shared&_pragma=foreign_keys(1)", uuid.New().String())
@@ -122,7 +133,12 @@ func NewSQLiteDAO(dsn string) (*SQLDAO, error) {
 		return nil, fmt.Errorf("failed to enable foreign keys on sqlite database: %w", err)
 	}
 
-	return NewSQLDAO(db, SQLiteDialect{}), nil
+	dao, err := NewSQLDAO(db, SQLiteDialect{})
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return dao, nil
 }
 
 // NewPostgresDAO connects to a PostgreSQL or CockroachDB database and initializes the DAO.
@@ -146,17 +162,58 @@ func NewPostgresDAO(dsn string) (*SQLDAO, error) {
 		return nil, fmt.Errorf("failed to ping postgres database: %w", err)
 	}
 
-	return NewSQLDAO(db, PostgresDialect{}), nil
+	dao, err := NewSQLDAO(db, PostgresDialect{})
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return dao, nil
 }
 
-// Migrate executes the schema DDL for the configured dialect.
+// Migrate executes the schema migrations for the configured dialect to bring the database to the latest version.
 func (s *SQLDAO) Migrate(ctx context.Context) error {
-	ddl := s.dialect.SchemaDDL()
-	_, err := s.db.ExecContext(ctx, ddl)
-	if err != nil {
-		return fmt.Errorf("failed to execute schema migration: %w", err)
+	if s.migrator == nil {
+		return errors.New("migrator is not initialized")
 	}
-	return nil
+	_, err := s.migrator.Up(ctx)
+	return err
+}
+
+// MigrateUp executes all pending database migrations in ascending order.
+func (s *SQLDAO) MigrateUp(ctx context.Context) (int, error) {
+	if s.migrator == nil {
+		return 0, errors.New("migrator is not initialized")
+	}
+	return s.migrator.Up(ctx)
+}
+
+// MigrateDown rolls back the specified number of applied migrations in descending order.
+func (s *SQLDAO) MigrateDown(ctx context.Context, steps int) (int, error) {
+	if s.migrator == nil {
+		return 0, errors.New("migrator is not initialized")
+	}
+	return s.migrator.Down(ctx, steps)
+}
+
+// MigrationVersion returns the highest applied migration version.
+func (s *SQLDAO) MigrationVersion(ctx context.Context) (int64, error) {
+	if s.migrator == nil {
+		return 0, errors.New("migrator is not initialized")
+	}
+	return s.migrator.Version(ctx)
+}
+
+// MigrationStatus returns status information for all registered migrations.
+func (s *SQLDAO) MigrationStatus(ctx context.Context) ([]MigrationStatus, error) {
+	if s.migrator == nil {
+		return nil, errors.New("migrator is not initialized")
+	}
+	return s.migrator.Status(ctx)
+}
+
+// Migrator returns the underlying Migrator instance.
+func (s *SQLDAO) Migrator() *Migrator {
+	return s.migrator
 }
 
 // Ping verifies connectivity to the underlying database pool.

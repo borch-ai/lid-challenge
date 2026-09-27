@@ -115,6 +115,29 @@ APP_ENV=development DB_DRIVER=cockroach DB_DSN="postgres://root@localhost:26257/
 make docker-down
 ```
 
+### 7. Database Schema Migrations
+The service includes an embedded, version-tracked database schema migration engine supporting SQLite, PostgreSQL, and CockroachDB:
+
+* **Migration Files**: Versioned `.up.sql` and `.down.sql` files stored under [`internal/dao/migrations/`](internal/dao/migrations/) and embedded into the binary via `embed.FS` (pure Go, zero CGO).
+* **Audit Tracking Table**: `schema_migrations` records applied version numbers, migration names, and application timestamps.
+* **Transactional Execution**: Migration steps are applied atomically inside database transactions.
+* **CLI Subcommands**:
+  ```bash
+  # Check status of all registered migrations
+  ./bin/lid-server migrate status
+
+  # Apply all pending migrations
+  ./bin/lid-server migrate up
+
+  # Show current schema version
+  ./bin/lid-server migrate version
+
+  # Roll back 1 migration step (or specify number of steps)
+  ./bin/lid-server migrate down 1
+  ```
+* **Decoupled Deployment & Startup Control**:
+  By default, `MIGRATE_ON_STARTUP=true` runs pending migrations on server boot. In containerized production environments (e.g. Kubernetes), operators can set `MIGRATE_ON_STARTUP=false` and run `lid-server migrate up` within an init container before starting replicas.
+
 ---
 
 ## 🪐 Running Locally with OrbStack

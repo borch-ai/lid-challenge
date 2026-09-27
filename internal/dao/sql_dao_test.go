@@ -388,6 +388,36 @@ func TestDialect(t *testing.T) {
 	if sqliteDialect.Rebind("SELECT ?") != "SELECT ?" {
 		t.Errorf("expected unchanged query for sqlite rebind")
 	}
+	if len(sqliteDialect.SchemaDDL()) == 0 {
+		t.Error("expected non-empty schema DDL for sqlite")
+	}
+
+	// Test isUniqueViolation branches
+	if isUniqueViolation(nil) {
+		t.Errorf("expected isUniqueViolation(nil) to be false")
+	}
+	if !isUniqueViolation(&pq.Error{Code: "23505"}) {
+		t.Errorf("expected isUniqueViolation to return true for pq.Error with 23505")
+	}
+	if isUniqueViolation(&pq.Error{Code: "40001"}) {
+		t.Errorf("expected isUniqueViolation to return false for pq.Error with 40001")
+	}
+	if !isUniqueViolation(errors.New("UNIQUE constraint failed")) {
+		t.Errorf("expected isUniqueViolation to return true for SQLite unique violation")
+	}
+	if !isUniqueViolation(errors.New("duplicate key value violates unique constraint")) {
+		t.Errorf("expected isUniqueViolation to return true for duplicate error string")
+	}
+	if isUniqueViolation(errors.New("other error")) {
+		t.Errorf("expected isUniqueViolation to return false for unrelated error")
+	}
+
+	// Test NewSQLiteDAO with explicit DSN containing question mark
+	queryDAO, err := NewSQLiteDAO("file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("expected NewSQLiteDAO with query params to succeed, got %v", err)
+	}
+	_ = queryDAO.Close()
 
 	// DialectFor
 	d, err := DialectFor("postgres")

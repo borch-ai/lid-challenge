@@ -31,6 +31,7 @@ test-system: build
 ## Run all unit tests with race detector and coverage
 test:
 	go test -race -coverprofile=$(COVERAGE_FILE) -covermode=atomic ./internal/...
+	go test -race ./cmd/server/...
 
 ## Verify unit test coverage meets the strict threshold
 check-coverage: test

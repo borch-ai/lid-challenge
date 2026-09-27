@@ -14,12 +14,36 @@ import (
 	"github.com/borch-ai/lid-challenge/internal/connector"
 )
 
+// DBConfig contains database connection parameters needed for database operations like migrations.
+type DBConfig struct {
+	Driver           string
+	DSN              string
+	Debug            bool
+	MigrateOnStartup bool
+}
+
+// LoadDBConfig loads only the database configuration parameters without requiring application or vendor secrets.
+func LoadDBConfig() (*DBConfig, error) {
+	driver := strings.ToLower(strings.TrimSpace(getEnv("DB_DRIVER", "sqlite")))
+	dsn := getEnv("DB_DSN", "lid.db")
+	debug := getEnvBool("DEBUG", false)
+	migrateOnStartup := getEnvBool("MIGRATE_ON_STARTUP", true)
+
+	return &DBConfig{
+		Driver:           driver,
+		DSN:              dsn,
+		Debug:            debug,
+		MigrateOnStartup: migrateOnStartup,
+	}, nil
+}
+
 // AppConfig contains all operational configuration parameters for the application.
 type AppConfig struct {
-	Server   api.Config
-	DBDriver string
-	DBDSN    string
-	Debug    bool
+	Server           api.Config
+	DBDriver         string
+	DBDSN            string
+	Debug            bool
+	MigrateOnStartup bool
 
 	VendorABC connector.VendorConfig
 	VendorXYZ connector.VendorConfig
@@ -98,6 +122,7 @@ func Load() (*AppConfig, error) {
 		}
 	}
 	debug := getEnvBool("DEBUG", false)
+	migrateOnStartup := getEnvBool("MIGRATE_ON_STARTUP", true)
 
 	cfg := &AppConfig{
 		Server: api.Config{
@@ -107,9 +132,10 @@ func Load() (*AppConfig, error) {
 			RateLimitBurst: rateLimitBurst,
 			TrustedProxies: trustedProxies,
 		},
-		DBDriver: dbDriver,
-		DBDSN:    dbDSN,
-		Debug:    debug,
+		DBDriver:         dbDriver,
+		DBDSN:            dbDSN,
+		Debug:            debug,
+		MigrateOnStartup: migrateOnStartup,
 
 		VendorABC: connector.VendorConfig{
 			ProviderName:    "ABC",

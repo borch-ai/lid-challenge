@@ -135,8 +135,27 @@ The service includes an embedded, version-tracked database schema migration engi
   # Roll back 1 migration step (or specify number of steps)
   ./bin/lid-server migrate down 1
   ```
-* **Decoupled Deployment & Startup Control**:
-  By default, `MIGRATE_ON_STARTUP=true` runs pending migrations on server boot. In containerized production environments (e.g. Kubernetes), operators can set `MIGRATE_ON_STARTUP=false` and run `lid-server migrate up` within an init container before starting replicas.
+### 8. Multi-Datastore Routing & NoSQL Support (Option B)
+The service supports both relational (SQLite, PostgreSQL, CockroachDB) and document/NoSQL datastores with zero-downtime migration routing:
+
+* **Persistence Modes (`PERSISTENCE_MODE`)**:
+  * `sql_only` *(default)*: All reads and writes target the primary SQL store.
+  * `dual_write`: Primary is SQL; successful writes asynchronously/synchronously replicate to the secondary NoSQL store with error isolation. Reads are served by SQL.
+  * `dual_write_nosql_primary`: Primary is NoSQL; writes replicate to secondary SQL store. Reads are served by NoSQL.
+  * `nosql_only`: All reads and writes target the NoSQL store.
+* **Environment Configuration**:
+  ```bash
+  # Standalone NoSQL mode
+  APP_ENV=development DB_DRIVER=nosql go run ./cmd/server/main.go
+
+  # Dual-write mode (SQL primary with NoSQL secondary replica)
+  APP_ENV=development \
+    DB_DRIVER=sqlite DB_DSN="lid.db" \
+    PERSISTENCE_MODE=dual_write \
+    SECONDARY_DB_DRIVER=nosql SECONDARY_DB_DSN="memory://" \
+    go run ./cmd/server/main.go
+  ```
+* **Future Option A Roadmap**: See [`TODO.md`](TODO.md) for dynamic feature flags (OpenFeature), live shadow reads, outbox CDC, and automated canary rollouts.
 
 ---
 

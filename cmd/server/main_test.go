@@ -92,8 +92,68 @@ func TestInitUserDAO(t *testing.T) {
 	}
 	_ = d1.Close()
 
-	// 2. Unsupported
+	// 2. NoSQL drivers
+	for _, drv := range []string{"nosql", "document", "mongodb", "memory"} {
+		d, err := initUserDAO(drv, "")
+		if err != nil {
+			t.Fatalf("expected %s init to succeed, got %v", drv, err)
+		}
+		_ = d.Close()
+	}
+
+	// 3. Postgres driver routes to NewPostgresDAO
+	if _, err := initUserDAO("postgres", ""); err == nil {
+		t.Errorf("expected error for postgres with empty DSN, got nil")
+	}
+
+	// 4. Unsupported
 	if _, err := initUserDAO("unsupported_driver", ""); err == nil {
 		t.Errorf("expected error for unsupported driver, got nil")
 	}
 }
+
+func TestRunMigrationCLI_NoSQLAndRoutingDAO(t *testing.T) {
+	nosqlDAO, err := dao.NewNoSQLDAO("")
+	if err != nil {
+		t.Fatalf("failed to create nosql dao: %v", err)
+	}
+	defer func() { _ = nosqlDAO.Close() }()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// Status on NoSQL DAO
+	out := captureStdout(func() {
+		runMigrationCLI(nosqlDAO, []string{"status"}, logger)
+	})
+	if !strings.Contains(out, "VERSION") {
+		t.Errorf("expected status output with VERSION, got: %s", out)
+	}
+
+	// Up on NoSQL DAO
+	out = captureStdout(func() {
+		runMigrationCLI(nosqlDAO, []string{"up"}, logger)
+	})
+	if !strings.Contains(out, "Successfully applied") {
+		t.Errorf("expected migration up success, got: %s", out)
+	}
+
+	// RoutingDAO migration CLI
+	sqliteDAO, err := dao.NewSQLiteDAO("file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("failed to create sqlite dao: %v", err)
+	}
+	defer func() { _ = sqliteDAO.Close() }()
+
+	rDAO, err := dao.NewRoutingDAO(dao.PersistenceModeDualWrite, sqliteDAO, nosqlDAO, logger)
+	if err != nil {
+		t.Fatalf("failed to create routing dao: %v", err)
+	}
+
+	out = captureStdout(func() {
+		runMigrationCLI(rDAO, []string{"up"}, logger)
+	})
+	if !strings.Contains(out, "Successfully applied") {
+		t.Errorf("expected migration up success on routing dao, got: %s", out)
+	}
+}
+

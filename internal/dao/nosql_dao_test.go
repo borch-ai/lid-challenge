@@ -490,6 +490,89 @@ func TestNoSQLDAO_FilePersistence(t *testing.T) {
 	if _, err := NewNoSQLDAO(nullDocFile); err == nil {
 		t.Error("expected error loading JSON file containing null document, got nil")
 	}
+
+	// Phase 8: Reject duplicate usernames when loading file store
+	dupUserJSON := `{
+		"user1": {"id": "user1", "profile": {"name": "U1", "phone": "123"}, "credential": {"username": "dupuser", "password_hash": "h1"}},
+		"user2": {"id": "user2", "profile": {"name": "U2", "phone": "456"}, "credential": {"username": "dupuser", "password_hash": "h2"}}
+	}`
+	dupFile := filepath.Join(tmpDir, "dupuser.json")
+	if err := os.WriteFile(dupFile, []byte(dupUserJSON), 0600); err != nil {
+		t.Fatalf("failed to write dupuser file: %v", err)
+	}
+	if _, err := NewNoSQLDAO(dupFile); err == nil {
+		t.Error("expected error loading file with duplicate usernames in raw map, got nil")
+	}
+
+	dupPayloadJSON := `{
+		"version": 1,
+		"documents": {
+			"user1": {"id": "user1", "profile": {"name": "U1", "phone": "123"}, "credential": {"username": "dupuser2", "password_hash": "h1"}},
+			"user2": {"id": "user2", "profile": {"name": "U2", "phone": "456"}, "credential": {"username": "dupuser2", "password_hash": "h2"}}
+		}
+	}`
+	dupPayloadFile := filepath.Join(tmpDir, "dup_payload.json")
+	if err := os.WriteFile(dupPayloadFile, []byte(dupPayloadJSON), 0600); err != nil {
+		t.Fatalf("failed to write dup payload file: %v", err)
+	}
+	if _, err := NewNoSQLDAO(dupPayloadFile); err == nil {
+		t.Error("expected error loading file with duplicate usernames in structured payload, got nil")
+	}
+
+	// Phase 9: Restore migration state when persistence fails in Migrate()
+	corruptMigFile := filepath.Join(tmpDir, "corrupt_mig.json")
+	if err := os.WriteFile(corruptMigFile, []byte(`{}`), 0600); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+	corruptMigStore, err := NewNoSQLDAO(corruptMigFile)
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer func() { _ = corruptMigStore.Close() }()
+
+	// Corrupt file on disk so persistLocked fails on reload
+	if err := os.WriteFile(corruptMigFile, []byte("bad-json"), 0600); err != nil {
+		t.Fatalf("failed to corrupt file: %v", err)
+	}
+	if err := corruptMigStore.Migrate(ctx); err == nil {
+		t.Error("expected Migrate to fail when disk file is corrupted, got nil")
+	}
+	// Verify state was restored: migrated should still be false and version 0
+	verAfterFail, err := corruptMigStore.MigrationVersion(ctx)
+	if err != nil || verAfterFail != 0 {
+		t.Errorf("expected version 0 after failed Migrate, got %d, err %v", verAfterFail, err)
+	}
+
+	// Phase 10: Reject duplicate usernames during reload merge in persistLocked
+	diskReloadFile := filepath.Join(tmpDir, "reload_dup.json")
+	initialJSON := `{
+		"user1": {"id": "user1", "profile": {"name": "U1", "phone": "123"}, "credential": {"username": "unique1", "password_hash": "h1"}}
+	}`
+	if err := os.WriteFile(diskReloadFile, []byte(initialJSON), 0600); err != nil {
+		t.Fatalf("failed to write reload file: %v", err)
+	}
+	reloadStore, err := NewNoSQLDAO(diskReloadFile)
+	if err != nil {
+		t.Fatalf("failed to open reload store: %v", err)
+	}
+	defer func() { _ = reloadStore.Close() }()
+
+	// Create user with username "conflict" in store
+	if _, err := reloadStore.CreateUser(ctx, &models.UserProfile{ID: "local1", Name: "Local", Phone: "111"}, &models.UserCredential{Username: "conflict", PasswordHash: hash}); err != nil {
+		t.Fatalf("failed to create local user: %v", err)
+	}
+	// Simulate external process writing a different user ID with the same username "conflict" to disk
+	externalJSON := `{
+		"user1": {"id": "user1", "profile": {"name": "U1", "phone": "123"}, "credential": {"username": "unique1", "password_hash": "h1"}},
+		"external1": {"id": "external1", "profile": {"name": "Ext", "phone": "222"}, "credential": {"username": "conflict", "password_hash": "h2"}}
+	}`
+	if err := os.WriteFile(diskReloadFile, []byte(externalJSON), 0600); err != nil {
+		t.Fatalf("failed to write external JSON: %v", err)
+	}
+	// Another local write triggers reload and must detect username collision with local1
+	if _, err := reloadStore.CreateUser(ctx, &models.UserProfile{ID: "local2", Name: "Local 2", Phone: "333"}, &models.UserCredential{Username: "local2", PasswordHash: hash}); err == nil {
+		t.Error("expected error when disk reload introduces duplicate username for another ID, got nil")
+	}
 }
 
 func TestNoSQLDAO_ContextCancelledAndClosedErrors(t *testing.T) {

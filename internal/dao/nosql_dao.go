@@ -69,6 +69,22 @@ type nosqlFilePayload struct {
 	Documents map[string]*userDocument `json:"documents"`
 }
 
+func validateDocuments(filePath string, docs map[string]*userDocument) error {
+	seenUsernames := make(map[string]string, len(docs))
+	for id, doc := range docs {
+		if doc == nil {
+			return fmt.Errorf("document store file %q contains null document for user ID %q", filePath, id)
+		}
+		if doc.Credential.Username != "" {
+			if existingID, exists := seenUsernames[doc.Credential.Username]; exists && existingID != id {
+				return fmt.Errorf("document store file %q contains duplicate username %q for user IDs %q and %q", filePath, doc.Credential.Username, existingID, id)
+			}
+			seenUsernames[doc.Credential.Username] = id
+		}
+	}
+	return nil
+}
+
 func parseDocumentStoreFile(filePath string, data []byte) (map[string]*userDocument, int64, *time.Time, error) {
 	if len(data) == 0 {
 		return make(map[string]*userDocument), 0, nil, nil
@@ -77,10 +93,8 @@ func parseDocumentStoreFile(filePath string, data []byte) (map[string]*userDocum
 	// 1. Try structured payload containing version metadata and documents map
 	var payload nosqlFilePayload
 	if err := json.Unmarshal(data, &payload); err == nil && payload.Documents != nil {
-		for id, doc := range payload.Documents {
-			if doc == nil {
-				return nil, 0, nil, fmt.Errorf("document store file %q contains null document for user ID %q", filePath, id)
-			}
+		if err := validateDocuments(filePath, payload.Documents); err != nil {
+			return nil, 0, nil, err
 		}
 		return payload.Documents, payload.Version, payload.AppliedAt, nil
 	}
@@ -93,10 +107,8 @@ func parseDocumentStoreFile(filePath string, data []byte) (map[string]*userDocum
 	if rawDocs == nil {
 		return nil, 0, nil, fmt.Errorf("document store file %q decoded to null, expected document map", filePath)
 	}
-	for id, doc := range rawDocs {
-		if doc == nil {
-			return nil, 0, nil, fmt.Errorf("document store file %q contains null document for user ID %q", filePath, id)
-		}
+	if err := validateDocuments(filePath, rawDocs); err != nil {
+		return nil, 0, nil, err
 	}
 	return rawDocs, 0, nil, nil
 }
@@ -150,6 +162,9 @@ func NewNoSQLDAO(dsn string) (*NoSQLDAO, error) {
 			}
 			for id, doc := range loaded {
 				if doc != nil && doc.Credential.Username != "" {
+					if existingID, exists := dao.byUsername[doc.Credential.Username]; exists && existingID != id {
+						return nil, fmt.Errorf("document store file %q contains duplicate username %q for user IDs %q and %q", filePath, doc.Credential.Username, existingID, id)
+					}
 					dao.byUsername[doc.Credential.Username] = id
 				}
 			}
@@ -179,10 +194,13 @@ func (d *NoSQLDAO) persistLocked() error {
 		for id, diskDoc := range diskDocs {
 			existing, exists := d.docs[id]
 			if !exists || diskDoc.UpdatedAt.After(existing.UpdatedAt) {
-				d.docs[id] = diskDoc
 				if diskDoc.Credential.Username != "" {
+					if existingID, ok := d.byUsername[diskDoc.Credential.Username]; ok && existingID != id {
+						return fmt.Errorf("reload document store file %q detected duplicate username %q for user IDs %q and %q", cleanPath, diskDoc.Credential.Username, existingID, id)
+					}
 					d.byUsername[diskDoc.Credential.Username] = id
 				}
+				d.docs[id] = diskDoc
 			}
 		}
 		if diskVer > 0 && !d.migrated {
@@ -478,6 +496,8 @@ func (d *NoSQLDAO) Migrate(ctx context.Context) error {
 		now := time.Now().UTC()
 		d.appliedAt = &now
 		if err := d.persistLocked(); err != nil {
+			d.migrated = false
+			d.appliedAt = nil
 			return err
 		}
 	}

@@ -127,13 +127,23 @@ func TestBuildRoutingDAO(t *testing.T) {
 		t.Errorf("expected sqlDAO and nosqlDAO mapped correctly")
 	}
 
-	// driver1 NoSQL, driver2 SQL
-	r2, err := buildRoutingDAO(dao.PersistenceModeDualWrite, "nosql", nosqlDAO, "sqlite", sqliteDAO, nil)
+	// driver1 NoSQL, driver2 SQL for dual_write_nosql_primary
+	r2, err := buildRoutingDAO(dao.PersistenceModeDualWriteNoSQLPrimary, "nosql", nosqlDAO, "sqlite", sqliteDAO, nil)
 	if err != nil {
-		t.Fatalf("failed buildRoutingDAO with inverted drivers: %v", err)
+		t.Fatalf("failed buildRoutingDAO with dual_write_nosql_primary: %v", err)
 	}
 	if r2.SQLDAO() != sqliteDAO || r2.NoSQLDAO() != nosqlDAO {
-		t.Errorf("expected inverted drivers to map sqlDAO and nosqlDAO correctly")
+		t.Errorf("expected dual_write_nosql_primary to map sqlDAO and nosqlDAO correctly")
+	}
+
+	// Reject inverted driver orientation: dual_write with NoSQL primary
+	if _, err := buildRoutingDAO(dao.PersistenceModeDualWrite, "nosql", nosqlDAO, "sqlite", sqliteDAO, nil); err == nil {
+		t.Errorf("expected error when dual_write has NoSQL primary driver, got nil")
+	}
+
+	// Reject inverted driver orientation: dual_write_nosql_primary with SQL primary
+	if _, err := buildRoutingDAO(dao.PersistenceModeDualWriteNoSQLPrimary, "sqlite", sqliteDAO, "nosql", nosqlDAO, nil); err == nil {
+		t.Errorf("expected error when dual_write_nosql_primary has SQL primary driver, got nil")
 	}
 
 	// Reject same-kind SQL driver pairs
@@ -186,6 +196,18 @@ func TestValidatePersistenceConfig(t *testing.T) {
 	// 6. Unknown persistence mode
 	if err := validatePersistenceConfig("unknown_mode", "sqlite", ""); err == nil {
 		t.Error("expected error for unknown persistence mode, got nil")
+	}
+	// 7. dual_write with inverted drivers (NoSQL primary)
+	if err := validatePersistenceConfig("dual_write", "nosql", "sqlite"); err == nil {
+		t.Error("expected error for dual_write with NoSQL primary driver, got nil")
+	}
+	// 8. dual_write_nosql_primary with inverted drivers (SQL primary)
+	if err := validatePersistenceConfig("dual_write_nosql_primary", "sqlite", "nosql"); err == nil {
+		t.Error("expected error for dual_write_nosql_primary with SQL primary driver, got nil")
+	}
+	// 9. dual_write_nosql_primary without secondary driver
+	if err := validatePersistenceConfig("dual_write_nosql_primary", "nosql", ""); err == nil {
+		t.Error("expected error for dual_write_nosql_primary without secondary driver, got nil")
 	}
 }
 

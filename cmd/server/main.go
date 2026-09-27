@@ -55,17 +55,25 @@ func validatePersistenceConfig(modeStr, primaryDriver, secondaryDriver string) e
 		if !isNoSQLDriver(primaryDriver) {
 			return fmt.Errorf("persistence mode %q requires a NoSQL primary driver, but primary driver is %q", mode, primaryDriver)
 		}
-	case dao.PersistenceModeDualWrite, dao.PersistenceModeDualWriteNoSQLPrimary:
+	case dao.PersistenceModeDualWrite:
 		if secondaryDriver == "" {
 			return fmt.Errorf("secondary database driver must be configured when dual-write persistence mode (%s) is active", mode)
 		}
-		isNoSQL1 := isNoSQLDriver(primaryDriver)
-		isNoSQL2 := isNoSQLDriver(secondaryDriver)
-		if isNoSQL1 == isNoSQL2 {
-			if isNoSQL1 {
-				return fmt.Errorf("dual-write persistence mode requires one SQL driver and one NoSQL driver; both %q and %q are NoSQL drivers", primaryDriver, secondaryDriver)
-			}
-			return fmt.Errorf("dual-write persistence mode requires one SQL driver and one NoSQL driver; both %q and %q are SQL drivers", primaryDriver, secondaryDriver)
+		if isNoSQLDriver(primaryDriver) {
+			return fmt.Errorf("persistence mode %q requires a SQL primary driver, but primary driver is %q", mode, primaryDriver)
+		}
+		if !isNoSQLDriver(secondaryDriver) {
+			return fmt.Errorf("persistence mode %q requires a NoSQL secondary driver, but secondary driver is %q", mode, secondaryDriver)
+		}
+	case dao.PersistenceModeDualWriteNoSQLPrimary:
+		if secondaryDriver == "" {
+			return fmt.Errorf("secondary database driver must be configured when dual-write persistence mode (%s) is active", mode)
+		}
+		if !isNoSQLDriver(primaryDriver) {
+			return fmt.Errorf("persistence mode %q requires a NoSQL primary driver, but primary driver is %q", mode, primaryDriver)
+		}
+		if isNoSQLDriver(secondaryDriver) {
+			return fmt.Errorf("persistence mode %q requires a SQL secondary driver, but secondary driver is %q", mode, secondaryDriver)
 		}
 	}
 	return nil

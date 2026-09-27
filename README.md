@@ -140,8 +140,8 @@ The service supports both relational (SQLite, PostgreSQL, CockroachDB) and docum
 
 * **Persistence Modes (`PERSISTENCE_MODE`)**:
   * `sql_only` *(default)*: All reads and writes target the primary SQL store.
-  * `dual_write`: Primary is SQL; successful writes asynchronously/synchronously replicate to the secondary NoSQL store with error isolation. Reads are served by SQL.
-  * `dual_write_nosql_primary`: Primary is NoSQL; writes replicate to secondary SQL store. Reads are served by NoSQL.
+  * `dual_write`: Primary is SQL; successful writes synchronously replicate to the secondary NoSQL store with fault isolation. Reads are served by SQL.
+  * `dual_write_nosql_primary`: Primary is NoSQL; successful writes synchronously replicate to the secondary SQL store with fault isolation. Reads are served by NoSQL.
   * `nosql_only`: All reads and writes target the NoSQL store.
 * **Environment Configuration**:
   ```bash

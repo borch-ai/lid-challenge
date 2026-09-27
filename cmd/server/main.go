@@ -42,11 +42,19 @@ func initUserDAO(driver, dsn string) (dao.UserDAO, error) {
 }
 
 func buildRoutingDAO(mode dao.PersistenceMode, driver1 string, dao1 dao.UserDAO, driver2 string, dao2 dao.UserDAO, logger *slog.Logger) (*dao.RoutingDAO, error) {
-	if isNoSQLDriver(driver1) && !isNoSQLDriver(driver2) {
+	isNoSQL1 := isNoSQLDriver(driver1)
+	isNoSQL2 := isNoSQLDriver(driver2)
+	if isNoSQL1 == isNoSQL2 {
+		if isNoSQL1 {
+			return nil, fmt.Errorf("dual-write persistence mode requires one SQL driver and one NoSQL driver; both %q and %q are NoSQL drivers", driver1, driver2)
+		}
+		return nil, fmt.Errorf("dual-write persistence mode requires one SQL driver and one NoSQL driver; both %q and %q are SQL drivers", driver1, driver2)
+	}
+	if isNoSQL1 && !isNoSQL2 {
 		// driver1 is NoSQL, driver2 is SQL
 		return dao.NewRoutingDAO(mode, dao2, dao1, logger)
 	}
-	// driver1 is SQL, driver2 is NoSQL (or default)
+	// driver1 is SQL, driver2 is NoSQL
 	return dao.NewRoutingDAO(mode, dao1, dao2, logger)
 }
 

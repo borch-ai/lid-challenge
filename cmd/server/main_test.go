@@ -135,6 +135,16 @@ func TestBuildRoutingDAO(t *testing.T) {
 	if r2.SQLDAO() != sqliteDAO || r2.NoSQLDAO() != nosqlDAO {
 		t.Errorf("expected inverted drivers to map sqlDAO and nosqlDAO correctly")
 	}
+
+	// Reject same-kind SQL driver pairs
+	if _, err := buildRoutingDAO(dao.PersistenceModeDualWrite, "sqlite", sqliteDAO, "postgres", sqliteDAO, nil); err == nil {
+		t.Errorf("expected error when both drivers are SQL, got nil")
+	}
+
+	// Reject same-kind NoSQL driver pairs
+	if _, err := buildRoutingDAO(dao.PersistenceModeDualWrite, "nosql", nosqlDAO, "memory", nosqlDAO, nil); err == nil {
+		t.Errorf("expected error when both drivers are NoSQL, got nil")
+	}
 }
 
 func TestRunMigrationCLI_NoSQLAndRoutingDAO(t *testing.T) {

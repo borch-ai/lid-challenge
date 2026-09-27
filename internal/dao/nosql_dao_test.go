@@ -375,6 +375,12 @@ func TestNoSQLDAO_FilePersistence(t *testing.T) {
 	if err != nil || reloadedCred.UserID != id {
 		t.Fatalf("expected reloaded credential from disk, got: %+v, err: %v", reloadedCred, err)
 	}
+
+	// Verify credential verification succeeds after reload from disk
+	authed, err := store2.VerifyUserCredential(ctx, "persist_user", "persistpass")
+	if err != nil || authed.ID != id {
+		t.Fatalf("expected successful credential verification from reloaded disk file, got: %v, err: %v", authed, err)
+	}
 }
 
 func TestNoSQLDAO_ContextCancelledAndClosedErrors(t *testing.T) {

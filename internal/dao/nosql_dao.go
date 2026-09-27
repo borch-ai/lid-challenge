@@ -18,14 +18,47 @@ import (
 	"github.com/borch-ai/lid-challenge/internal/security"
 )
 
+// storageCredential persists user credentials including the hashed password on disk.
+// This is distinct from models.UserCredential which omits PasswordHash from JSON serialization.
+type storageCredential struct {
+	UserID       string    `json:"user_id"`
+	Username     string    `json:"username"`
+	Method       string    `json:"method"`
+	PasswordHash string    `json:"password_hash"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+func (s storageCredential) toModel() models.UserCredential {
+	return models.UserCredential{
+		UserID:       s.UserID,
+		Username:     s.Username,
+		Method:       s.Method,
+		PasswordHash: s.PasswordHash,
+		CreatedAt:    s.CreatedAt,
+		UpdatedAt:    s.UpdatedAt,
+	}
+}
+
+func fromModelCredential(c models.UserCredential) storageCredential {
+	return storageCredential{
+		UserID:       c.UserID,
+		Username:     c.Username,
+		Method:       c.Method,
+		PasswordHash: c.PasswordHash,
+		CreatedAt:    c.CreatedAt,
+		UpdatedAt:    c.UpdatedAt,
+	}
+}
+
 // userDocument represents the unified NoSQL document structure storing
 // both user profile attributes and credentials in a single document pattern.
 type userDocument struct {
-	ID         string                `json:"id"`
-	Profile    models.UserProfile    `json:"profile"`
-	Credential models.UserCredential `json:"credential"`
-	CreatedAt  time.Time             `json:"created_at"`
-	UpdatedAt  time.Time             `json:"updated_at"`
+	ID         string             `json:"id"`
+	Profile    models.UserProfile `json:"profile"`
+	Credential storageCredential  `json:"credential"`
+	CreatedAt  time.Time          `json:"created_at"`
+	UpdatedAt  time.Time          `json:"updated_at"`
 }
 
 // NoSQLDAO implements UserDAO using a document store pattern supporting both
@@ -163,7 +196,7 @@ func (d *NoSQLDAO) CreateUser(ctx context.Context, profile *models.UserProfile, 
 	doc := &userDocument{
 		ID:         id,
 		Profile:    profCopy,
-		Credential: credCopy,
+		Credential: fromModelCredential(credCopy),
 		CreatedAt:  now,
 		UpdatedAt:  now,
 	}
@@ -250,10 +283,10 @@ func (d *NoSQLDAO) SearchProfiles(ctx context.Context, query models.SearchQuery)
 		matched = append(matched, &profCopy)
 	}
 
-	// Sort deterministically by CreatedAt DESC, then ID ASC
+	// Sort deterministically by CreatedAt DESC, then ID DESC (matching SQL DAO)
 	sort.Slice(matched, func(i, j int) bool {
 		if matched[i].CreatedAt.Equal(matched[j].CreatedAt) {
-			return matched[i].ID < matched[j].ID
+			return matched[i].ID > matched[j].ID
 		}
 		return matched[i].CreatedAt.After(matched[j].CreatedAt)
 	})
@@ -308,7 +341,7 @@ func (d *NoSQLDAO) GetCredential(ctx context.Context, username string) (*models.
 		return nil, ErrUserNotFound
 	}
 
-	cred := doc.Credential
+	cred := doc.Credential.toModel()
 	return &cred, nil
 }
 

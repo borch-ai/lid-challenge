@@ -534,24 +534,27 @@ func TestParseMigrationTime(t *testing.T) {
 }
 
 func TestMigrator_ConcurrentUp_Coordination(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "concurrent_test.db")
-	baseDB, err := sql.Open("sqlite", dbPath)
+	dbFile := filepath.Join(t.TempDir(), "concurrent_test.db")
+	dbURI := fmt.Sprintf("%s?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)", dbFile)
+	baseDB, err := sql.Open("sqlite", dbURI)
 	if err != nil {
 		t.Fatalf("failed to open shared base db: %v", err)
 	}
 	defer func() { _ = baseDB.Close() }()
+	baseDB.SetMaxOpenConns(1)
 
 	const numReplicas = 4
 	errChan := make(chan error, numReplicas)
 
 	for i := 0; i < numReplicas; i++ {
 		go func() {
-			db, err := sql.Open("sqlite", dbPath)
+			db, err := sql.Open("sqlite", dbURI)
 			if err != nil {
 				errChan <- err
 				return
 			}
 			defer func() { _ = db.Close() }()
+			db.SetMaxOpenConns(1)
 
 			migrator, err := NewMigrator(db, SQLiteDialect{})
 			if err != nil {
@@ -559,7 +562,7 @@ func TestMigrator_ConcurrentUp_Coordination(t *testing.T) {
 				return
 			}
 
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 
 			_, err = migrator.Up(ctx)

@@ -93,7 +93,7 @@ func TestInitUserDAO(t *testing.T) {
 	_ = d1.Close()
 
 	// 2. NoSQL drivers
-	for _, drv := range []string{"nosql", "document", "mongodb", "memory"} {
+	for _, drv := range []string{"nosql", "document", "memory"} {
 		d, err := initUserDAO(drv, "")
 		if err != nil {
 			t.Fatalf("expected %s init to succeed, got %v", drv, err)
@@ -106,9 +106,34 @@ func TestInitUserDAO(t *testing.T) {
 		t.Errorf("expected error for postgres with empty DSN, got nil")
 	}
 
-	// 4. Unsupported
-	if _, err := initUserDAO("unsupported_driver", ""); err == nil {
-		t.Errorf("expected error for unsupported driver, got nil")
+	// 4. Unsupported drivers
+	for _, drv := range []string{"unsupported_driver", "mongodb"} {
+		if _, err := initUserDAO(drv, ""); err == nil {
+			t.Errorf("expected error for unsupported driver %q, got nil", drv)
+		}
+	}
+}
+
+func TestBuildRoutingDAO(t *testing.T) {
+	sqliteDAO, _ := dao.NewSQLiteDAO("file::memory:?cache=shared")
+	nosqlDAO, _ := dao.NewNoSQLDAO("")
+
+	// driver1 SQL, driver2 NoSQL
+	r1, err := buildRoutingDAO(dao.PersistenceModeDualWrite, "sqlite", sqliteDAO, "nosql", nosqlDAO, nil)
+	if err != nil {
+		t.Fatalf("failed buildRoutingDAO: %v", err)
+	}
+	if r1.SQLDAO() != sqliteDAO || r1.NoSQLDAO() != nosqlDAO {
+		t.Errorf("expected sqlDAO and nosqlDAO mapped correctly")
+	}
+
+	// driver1 NoSQL, driver2 SQL
+	r2, err := buildRoutingDAO(dao.PersistenceModeDualWrite, "nosql", nosqlDAO, "sqlite", sqliteDAO, nil)
+	if err != nil {
+		t.Fatalf("failed buildRoutingDAO with inverted drivers: %v", err)
+	}
+	if r2.SQLDAO() != sqliteDAO || r2.NoSQLDAO() != nosqlDAO {
+		t.Errorf("expected inverted drivers to map sqlDAO and nosqlDAO correctly")
 	}
 }
 

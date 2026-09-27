@@ -19,17 +19,35 @@ import (
 	"github.com/borch-ai/lid-challenge/internal/dao"
 )
 
+func isNoSQLDriver(driver string) bool {
+	switch strings.ToLower(strings.TrimSpace(driver)) {
+	case "nosql", "document", "memory":
+		return true
+	default:
+		return false
+	}
+}
+
 func initUserDAO(driver, dsn string) (dao.UserDAO, error) {
 	switch strings.ToLower(strings.TrimSpace(driver)) {
 	case "sqlite", "sqlite3":
 		return dao.NewSQLiteDAO(dsn)
 	case "postgres", "postgresql", "cockroach", "cockroachdb":
 		return dao.NewPostgresDAO(dsn)
-	case "nosql", "document", "mongodb", "memory":
+	case "nosql", "document", "memory":
 		return dao.NewNoSQLDAO(dsn)
 	default:
 		return nil, fmt.Errorf("unsupported database driver: %s", driver)
 	}
+}
+
+func buildRoutingDAO(mode dao.PersistenceMode, driver1 string, dao1 dao.UserDAO, driver2 string, dao2 dao.UserDAO, logger *slog.Logger) (*dao.RoutingDAO, error) {
+	if isNoSQLDriver(driver1) && !isNoSQLDriver(driver2) {
+		// driver1 is NoSQL, driver2 is SQL
+		return dao.NewRoutingDAO(mode, dao2, dao1, logger)
+	}
+	// driver1 is SQL, driver2 is NoSQL (or default)
+	return dao.NewRoutingDAO(mode, dao1, dao2, logger)
 }
 
 func main() {
@@ -59,21 +77,26 @@ func main() {
 		}()
 
 		userDAO := primaryDAO
-		if dbCfg.SecondaryDriver != "" {
-			secDAO, err := initUserDAO(dbCfg.SecondaryDriver, dbCfg.SecondaryDSN)
-			if err != nil {
-				logger.Error("failed to connect to secondary database", slog.Any("error", err))
+		if dbCfg.SecondaryDriver != "" || dbCfg.PersistenceMode == string(dao.PersistenceModeDualWrite) || dbCfg.PersistenceMode == string(dao.PersistenceModeDualWriteNoSQLPrimary) {
+			if dbCfg.SecondaryDriver != "" {
+				secDAO, err := initUserDAO(dbCfg.SecondaryDriver, dbCfg.SecondaryDSN)
+				if err != nil {
+					logger.Error("failed to connect to secondary database", slog.Any("error", err))
+					os.Exit(1)
+				}
+				defer func() {
+					_ = secDAO.Close()
+				}()
+				rDAO, err := buildRoutingDAO(dao.PersistenceMode(dbCfg.PersistenceMode), dbCfg.Driver, primaryDAO, dbCfg.SecondaryDriver, secDAO, logger)
+				if err != nil {
+					logger.Error("failed to initialize routing DAO", slog.Any("error", err))
+					os.Exit(1)
+				}
+				userDAO = rDAO
+			} else if dbCfg.PersistenceMode == string(dao.PersistenceModeDualWrite) || dbCfg.PersistenceMode == string(dao.PersistenceModeDualWriteNoSQLPrimary) {
+				logger.Error("secondary database driver must be configured when dual-write persistence mode is active")
 				os.Exit(1)
 			}
-			defer func() {
-				_ = secDAO.Close()
-			}()
-			rDAO, err := dao.NewRoutingDAO(dao.PersistenceMode(dbCfg.PersistenceMode), primaryDAO, secDAO, logger)
-			if err != nil {
-				logger.Error("failed to initialize routing DAO", slog.Any("error", err))
-				os.Exit(1)
-			}
-			userDAO = rDAO
 		}
 
 		runMigrationCLI(userDAO, os.Args[2:], logger)
@@ -121,7 +144,7 @@ func main() {
 			defer func() {
 				_ = secDAO.Close()
 			}()
-			rDAO, err := dao.NewRoutingDAO(dao.PersistenceMode(cfg.PersistenceMode), primaryDAO, secDAO, logger)
+			rDAO, err := buildRoutingDAO(dao.PersistenceMode(cfg.PersistenceMode), cfg.DBDriver, primaryDAO, cfg.SecondaryDBDriver, secDAO, logger)
 			if err != nil {
 				logger.Error("failed to initialize routing DAO", slog.Any("error", err))
 				os.Exit(1)

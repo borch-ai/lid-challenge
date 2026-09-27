@@ -32,8 +32,8 @@ func LoadDBConfig() (*DBConfig, error) {
 	dsn := getEnv("DB_DSN", "lid.db")
 	debug := getEnvBool("DEBUG", false)
 	migrateOnStartup := getEnvBool("MIGRATE_ON_STARTUP", true)
-	persistenceMode := strings.ToLower(strings.TrimSpace(getEnv("PERSISTENCE_MODE", "sql_only")))
-	if _, err := dao.ParsePersistenceMode(persistenceMode); err != nil {
+	mode, err := dao.ParsePersistenceMode(getEnv("PERSISTENCE_MODE", "sql_only"))
+	if err != nil {
 		return nil, err
 	}
 	secondaryDriver := strings.ToLower(strings.TrimSpace(getEnv("SECONDARY_DB_DRIVER", "")))
@@ -44,7 +44,7 @@ func LoadDBConfig() (*DBConfig, error) {
 		DSN:              dsn,
 		Debug:            debug,
 		MigrateOnStartup: migrateOnStartup,
-		PersistenceMode:  persistenceMode,
+		PersistenceMode:  string(mode),
 		SecondaryDriver:  secondaryDriver,
 		SecondaryDSN:     secondaryDSN,
 	}, nil
@@ -140,8 +140,8 @@ func Load() (*AppConfig, error) {
 	}
 	debug := getEnvBool("DEBUG", false)
 	migrateOnStartup := getEnvBool("MIGRATE_ON_STARTUP", true)
-	persistenceMode := strings.ToLower(strings.TrimSpace(getEnv("PERSISTENCE_MODE", "sql_only")))
-	if _, err := dao.ParsePersistenceMode(persistenceMode); err != nil {
+	mode, err := dao.ParsePersistenceMode(getEnv("PERSISTENCE_MODE", "sql_only"))
+	if err != nil {
 		return nil, err
 	}
 	secondaryDBDriver := strings.ToLower(strings.TrimSpace(getEnv("SECONDARY_DB_DRIVER", "")))
@@ -159,7 +159,7 @@ func Load() (*AppConfig, error) {
 		DBDSN:             dbDSN,
 		Debug:             debug,
 		MigrateOnStartup:  migrateOnStartup,
-		PersistenceMode:   persistenceMode,
+		PersistenceMode:   string(mode),
 		SecondaryDBDriver: secondaryDBDriver,
 		SecondaryDBDSN:    secondaryDBDSN,
 

@@ -19,7 +19,7 @@ const (
 	// PersistenceModeSQLOnly routes all operations strictly to the SQL datastore.
 	PersistenceModeSQLOnly PersistenceMode = "sql_only"
 
-	// PersistenceModeDualWrite treats SQL as the primary source of truth and asynchronously/synchronously
+	// PersistenceModeDualWrite treats SQL as the primary source of truth and
 	// replicates writes to the secondary NoSQL datastore while serving reads from SQL.
 	PersistenceModeDualWrite PersistenceMode = "dual_write"
 
@@ -47,28 +47,40 @@ func ParsePersistenceMode(s string) (PersistenceMode, error) {
 	}
 }
 
-// RoutingDAO wraps primary and secondary UserDAO implementations to provide
+// RoutingDAO wraps SQL and NoSQL UserDAO implementations to provide
 // flexible routing, migration toggling, and zero-downtime dual-write capabilities.
 type RoutingDAO struct {
 	mu               sync.RWMutex
 	mode             PersistenceMode
-	primary          UserDAO
-	secondary        UserDAO
+	sqlDAO           UserDAO
+	nosqlDAO         UserDAO
 	logger           *slog.Logger
 	onSecondaryError func(op string, err error)
 }
 
-// NewRoutingDAO creates and configures a new RoutingDAO instance.
-func NewRoutingDAO(mode PersistenceMode, primary, secondary UserDAO, logger *slog.Logger) (*RoutingDAO, error) {
+// NewRoutingDAO creates and configures a new RoutingDAO instance with explicit SQL and NoSQL roles.
+func NewRoutingDAO(mode PersistenceMode, sqlDAO, nosqlDAO UserDAO, logger *slog.Logger) (*RoutingDAO, error) {
 	parsedMode, err := ParsePersistenceMode(string(mode))
 	if err != nil {
 		return nil, err
 	}
-	if primary == nil {
-		return nil, errors.New("primary DAO cannot be nil")
-	}
-	if (parsedMode == PersistenceModeDualWrite || parsedMode == PersistenceModeDualWriteNoSQLPrimary) && secondary == nil {
-		return nil, fmt.Errorf("secondary DAO is required for dual-write persistence mode %q", parsedMode)
+
+	switch parsedMode {
+	case PersistenceModeSQLOnly:
+		if sqlDAO == nil {
+			return nil, errors.New("sql DAO cannot be nil for sql_only mode")
+		}
+	case PersistenceModeNoSQLOnly:
+		if nosqlDAO == nil {
+			return nil, errors.New("nosql DAO cannot be nil for nosql_only mode")
+		}
+	case PersistenceModeDualWrite, PersistenceModeDualWriteNoSQLPrimary:
+		if sqlDAO == nil {
+			return nil, fmt.Errorf("sql DAO is required for dual-write persistence mode %q", parsedMode)
+		}
+		if nosqlDAO == nil {
+			return nil, fmt.Errorf("nosql DAO is required for dual-write persistence mode %q", parsedMode)
+		}
 	}
 
 	if logger == nil {
@@ -77,10 +89,26 @@ func NewRoutingDAO(mode PersistenceMode, primary, secondary UserDAO, logger *slo
 
 	return &RoutingDAO{
 		mode:      parsedMode,
-		primary:   primary,
-		secondary: secondary,
+		sqlDAO:    sqlDAO,
+		nosqlDAO:  nosqlDAO,
 		logger:    logger,
 	}, nil
+}
+
+// targets returns the active write primary (and read source) and the replication secondary for the current mode.
+func (r *RoutingDAO) targets() (primary, secondary UserDAO) {
+	switch r.mode {
+	case PersistenceModeSQLOnly:
+		return r.sqlDAO, nil
+	case PersistenceModeDualWrite:
+		return r.sqlDAO, r.nosqlDAO
+	case PersistenceModeDualWriteNoSQLPrimary:
+		return r.nosqlDAO, r.sqlDAO
+	case PersistenceModeNoSQLOnly:
+		return r.nosqlDAO, nil
+	default:
+		return r.sqlDAO, nil
+	}
 }
 
 // Mode returns the currently active persistence mode.
@@ -90,7 +118,7 @@ func (r *RoutingDAO) Mode() PersistenceMode {
 	return r.mode
 }
 
-// SetMode updates the active persistence mode dynamically.
+// SetMode updates the active persistence mode dynamically, immediately switching active read/write targets.
 func (r *RoutingDAO) SetMode(mode PersistenceMode) error {
 	parsedMode, err := ParsePersistenceMode(string(mode))
 	if err != nil {
@@ -98,25 +126,57 @@ func (r *RoutingDAO) SetMode(mode PersistenceMode) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if (parsedMode == PersistenceModeDualWrite || parsedMode == PersistenceModeDualWriteNoSQLPrimary) && r.secondary == nil {
-		return fmt.Errorf("secondary DAO is required for dual-write persistence mode %q", parsedMode)
+
+	switch parsedMode {
+	case PersistenceModeSQLOnly:
+		if r.sqlDAO == nil {
+			return errors.New("sql DAO is required for sql_only mode")
+		}
+	case PersistenceModeNoSQLOnly:
+		if r.nosqlDAO == nil {
+			return errors.New("nosql DAO is required for nosql_only mode")
+		}
+	case PersistenceModeDualWrite, PersistenceModeDualWriteNoSQLPrimary:
+		if r.sqlDAO == nil {
+			return fmt.Errorf("sql DAO is required for dual-write persistence mode %q", parsedMode)
+		}
+		if r.nosqlDAO == nil {
+			return fmt.Errorf("nosql DAO is required for dual-write persistence mode %q", parsedMode)
+		}
 	}
+
 	r.mode = parsedMode
 	return nil
 }
 
-// Primary returns the underlying primary DAO instance.
+// Primary returns the active primary DAO instance for the current persistence mode.
 func (r *RoutingDAO) Primary() UserDAO {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.primary
+	p, _ := r.targets()
+	return p
 }
 
-// Secondary returns the underlying secondary DAO instance, if configured.
+// Secondary returns the active secondary replication DAO instance for the current persistence mode.
 func (r *RoutingDAO) Secondary() UserDAO {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.secondary
+	_, s := r.targets()
+	return s
+}
+
+// SQLDAO returns the underlying SQL datastore instance, if configured.
+func (r *RoutingDAO) SQLDAO() UserDAO {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.sqlDAO
+}
+
+// NoSQLDAO returns the underlying NoSQL datastore instance, if configured.
+func (r *RoutingDAO) NoSQLDAO() UserDAO {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.nosqlDAO
 }
 
 // SetOnSecondaryError registers an optional callback for replication failures on the secondary store.
@@ -126,8 +186,8 @@ func (r *RoutingDAO) SetOnSecondaryError(fn func(op string, err error)) {
 	r.onSecondaryError = fn
 }
 
-// CreateUser writes the user profile and credentials to the primary datastore,
-// and replicates to the secondary datastore if dual-write is enabled.
+// CreateUser writes the user profile and credentials to the active primary datastore,
+// and replicates to the secondary datastore if dual-write mode is active.
 func (r *RoutingDAO) CreateUser(ctx context.Context, profile *models.UserProfile, cred *models.UserCredential) (string, error) {
 	if profile == nil || cred == nil {
 		return "", ErrInvalidInput
@@ -138,19 +198,22 @@ func (r *RoutingDAO) CreateUser(ctx context.Context, profile *models.UserProfile
 
 	r.mu.RLock()
 	mode := r.mode
-	primary := r.primary
-	secondary := r.secondary
+	primary, secondary := r.targets()
 	logger := r.logger
 	errHandler := r.onSecondaryError
 	r.mu.RUnlock()
 
-	// Write to primary datastore
+	if primary == nil {
+		return "", errors.New("no active primary datastore configured")
+	}
+
+	// Write to active primary datastore
 	id, err := primary.CreateUser(ctx, profile, cred)
 	if err != nil {
 		return "", err
 	}
 
-	// Replicate to secondary datastore if dual-write mode is active
+	// Replicate to active secondary datastore if dual-write mode is active
 	if secondary != nil && (mode == PersistenceModeDualWrite || mode == PersistenceModeDualWriteNoSQLPrimary) {
 		profCopy := *profile
 		profCopy.ID = id
@@ -173,93 +236,113 @@ func (r *RoutingDAO) CreateUser(ctx context.Context, profile *models.UserProfile
 	return id, nil
 }
 
-// GetProfile retrieves a user profile by unique user ID from the primary datastore.
+// GetProfile retrieves a user profile by unique user ID from the active primary datastore.
 func (r *RoutingDAO) GetProfile(ctx context.Context, userID string) (*models.UserProfile, error) {
 	r.mu.RLock()
-	primary := r.primary
+	primary, _ := r.targets()
 	r.mu.RUnlock()
+
+	if primary == nil {
+		return nil, errors.New("no active primary datastore configured")
+	}
 	return primary.GetProfile(ctx, userID)
 }
 
-// SearchProfiles finds user profiles matching search criteria using the primary datastore.
+// SearchProfiles finds user profiles matching search criteria using the active primary datastore.
 func (r *RoutingDAO) SearchProfiles(ctx context.Context, query models.SearchQuery) ([]*models.UserProfile, error) {
 	r.mu.RLock()
-	primary := r.primary
+	primary, _ := r.targets()
 	r.mu.RUnlock()
+
+	if primary == nil {
+		return nil, errors.New("no active primary datastore configured")
+	}
 	return primary.SearchProfiles(ctx, query)
 }
 
-// GetCredential retrieves user credential details by username from the primary datastore.
+// GetCredential retrieves user credential details by username from the active primary datastore.
 func (r *RoutingDAO) GetCredential(ctx context.Context, username string) (*models.UserCredential, error) {
 	r.mu.RLock()
-	primary := r.primary
+	primary, _ := r.targets()
 	r.mu.RUnlock()
+
+	if primary == nil {
+		return nil, errors.New("no active primary datastore configured")
+	}
 	return primary.GetCredential(ctx, username)
 }
 
-// VerifyUserCredential validates credentials against the primary datastore.
+// VerifyUserCredential validates credentials against the active primary datastore.
 func (r *RoutingDAO) VerifyUserCredential(ctx context.Context, username, password string) (*models.UserProfile, error) {
 	r.mu.RLock()
-	primary := r.primary
+	primary, _ := r.targets()
 	r.mu.RUnlock()
+
+	if primary == nil {
+		return nil, errors.New("no active primary datastore configured")
+	}
 	return primary.VerifyUserCredential(ctx, username, password)
 }
 
-// Migrate executes migrations on primary and secondary datastores.
+// Migrate executes migrations on both SQL and NoSQL datastores if configured.
 func (r *RoutingDAO) Migrate(ctx context.Context) error {
 	r.mu.RLock()
-	primary := r.primary
-	secondary := r.secondary
+	sqlDAO := r.sqlDAO
+	nosqlDAO := r.nosqlDAO
 	r.mu.RUnlock()
 
-	if err := primary.Migrate(ctx); err != nil {
-		return fmt.Errorf("primary datastore migration failed: %w", err)
+	if sqlDAO != nil {
+		if err := sqlDAO.Migrate(ctx); err != nil {
+			return fmt.Errorf("sql datastore migration failed: %w", err)
+		}
 	}
 
-	if secondary != nil {
-		if err := secondary.Migrate(ctx); err != nil {
-			return fmt.Errorf("secondary datastore migration failed: %w", err)
+	if nosqlDAO != nil {
+		if err := nosqlDAO.Migrate(ctx); err != nil {
+			return fmt.Errorf("nosql datastore migration failed: %w", err)
 		}
 	}
 
 	return nil
 }
 
-// Ping verifies connectivity to the primary and secondary datastores.
+// Ping verifies connectivity to both configured datastores.
 func (r *RoutingDAO) Ping(ctx context.Context) error {
 	r.mu.RLock()
-	primary := r.primary
-	secondary := r.secondary
+	sqlDAO := r.sqlDAO
+	nosqlDAO := r.nosqlDAO
 	r.mu.RUnlock()
 
-	if err := primary.Ping(ctx); err != nil {
-		return fmt.Errorf("primary datastore ping failed: %w", err)
+	if sqlDAO != nil {
+		if err := sqlDAO.Ping(ctx); err != nil {
+			return fmt.Errorf("sql datastore ping failed: %w", err)
+		}
 	}
 
-	if secondary != nil {
-		if err := secondary.Ping(ctx); err != nil {
-			return fmt.Errorf("secondary datastore ping failed: %w", err)
+	if nosqlDAO != nil {
+		if err := nosqlDAO.Ping(ctx); err != nil {
+			return fmt.Errorf("nosql datastore ping failed: %w", err)
 		}
 	}
 
 	return nil
 }
 
-// Close closes both primary and secondary datastores.
+// Close closes both SQL and NoSQL datastores.
 func (r *RoutingDAO) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	var errs []error
-	if r.primary != nil {
-		if err := r.primary.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to close primary datastore: %w", err))
+	if r.sqlDAO != nil {
+		if err := r.sqlDAO.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to close sql datastore: %w", err))
 		}
 	}
 
-	if r.secondary != nil {
-		if err := r.secondary.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to close secondary datastore: %w", err))
+	if r.nosqlDAO != nil {
+		if err := r.nosqlDAO.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to close nosql datastore: %w", err))
 		}
 	}
 
@@ -269,11 +352,10 @@ func (r *RoutingDAO) Close() error {
 	return nil
 }
 
-// MigrateUp executes pending migrations on primary and secondary datastores.
+// MigrateUp executes pending migrations on the active primary and secondary datastores.
 func (r *RoutingDAO) MigrateUp(ctx context.Context) (int, error) {
 	r.mu.RLock()
-	primary := r.primary
-	secondary := r.secondary
+	primary, secondary := r.targets()
 	r.mu.RUnlock()
 
 	var count int
@@ -296,10 +378,10 @@ func (r *RoutingDAO) MigrateUp(ctx context.Context) (int, error) {
 	return count, nil
 }
 
-// MigrateDown rolls back migrations on the primary datastore.
+// MigrateDown rolls back migrations on the active primary datastore.
 func (r *RoutingDAO) MigrateDown(ctx context.Context, steps int) (int, error) {
 	r.mu.RLock()
-	primary := r.primary
+	primary, _ := r.targets()
 	r.mu.RUnlock()
 
 	if m, ok := primary.(MigratableDAO); ok {
@@ -308,10 +390,10 @@ func (r *RoutingDAO) MigrateDown(ctx context.Context, steps int) (int, error) {
 	return 0, nil
 }
 
-// MigrationVersion returns the schema version of the primary datastore.
+// MigrationVersion returns the schema version of the active primary datastore.
 func (r *RoutingDAO) MigrationVersion(ctx context.Context) (int64, error) {
 	r.mu.RLock()
-	primary := r.primary
+	primary, _ := r.targets()
 	r.mu.RUnlock()
 
 	if m, ok := primary.(MigratableDAO); ok {
@@ -320,10 +402,10 @@ func (r *RoutingDAO) MigrationVersion(ctx context.Context) (int64, error) {
 	return 1, nil
 }
 
-// MigrationStatus returns migration statuses from the primary datastore.
+// MigrationStatus returns migration statuses from the active primary datastore.
 func (r *RoutingDAO) MigrationStatus(ctx context.Context) ([]MigrationStatus, error) {
 	r.mu.RLock()
-	primary := r.primary
+	primary, _ := r.targets()
 	r.mu.RUnlock()
 
 	if m, ok := primary.(MigratableDAO); ok {

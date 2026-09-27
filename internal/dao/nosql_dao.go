@@ -3,7 +3,11 @@ package dao
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -24,30 +28,94 @@ type userDocument struct {
 	UpdatedAt  time.Time             `json:"updated_at"`
 }
 
-// NoSQLDAO implements UserDAO using an in-memory document store pattern
+// NoSQLDAO implements UserDAO using a document store pattern supporting both
+// in-memory mode (for tests and ephemeral workloads) and durable JSON file backing
 // with secondary index management and atomic single-document write semantics.
 type NoSQLDAO struct {
 	mu         sync.RWMutex
+	filePath   string                   // Non-empty when durable file persistence is configured
 	docs       map[string]*userDocument // Primary index by user ID
 	byUsername map[string]string        // Unique secondary index: username -> user ID
 	closed     bool
-	indexed    bool
+	migrated   bool
 }
 
 // NewNoSQLDAO creates a new NoSQLDAO document store instance.
+// If dsn is empty, "memory", ":memory:", or starts with "memory://", data is held in-memory.
+// Otherwise, dsn is treated as a file path (or file:// URI) for durable document persistence.
 func NewNoSQLDAO(dsn string) (*NoSQLDAO, error) {
-	_ = dsn // DSN can specify storage options or collection names
-	return &NoSQLDAO{
+	trimmed := strings.TrimSpace(dsn)
+	var filePath string
+	if trimmed != "" && trimmed != "memory" && trimmed != ":memory:" && !strings.HasPrefix(trimmed, "memory://") {
+		filePath = strings.TrimPrefix(trimmed, "file://")
+	}
+
+	dao := &NoSQLDAO{
+		filePath:   filePath,
 		docs:       make(map[string]*userDocument),
 		byUsername: make(map[string]string),
-		indexed:    true,
-	}, nil
+		migrated:   false,
+	}
+
+	if filePath != "" {
+		cleanPath := filepath.Clean(filePath)
+		// #nosec G304 -- administrative datastore file path configured via DSN
+		if data, err := os.ReadFile(cleanPath); err == nil && len(data) > 0 {
+			var loaded map[string]*userDocument
+			if err := json.Unmarshal(data, &loaded); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal document store from %q: %w", filePath, err)
+			}
+			dao.docs = loaded
+			for id, doc := range loaded {
+				if doc != nil && doc.Credential.Username != "" {
+					dao.byUsername[doc.Credential.Username] = id
+				}
+			}
+		} else if err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("failed to read document store file %q: %w", filePath, err)
+		}
+	}
+
+	return dao, nil
+}
+
+func (d *NoSQLDAO) persistLocked() error {
+	if d.filePath == "" {
+		return nil
+	}
+
+	data, err := json.MarshalIndent(d.docs, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal document store: %w", err)
+	}
+
+	dir := filepath.Dir(d.filePath)
+	if dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0750); err != nil {
+			return fmt.Errorf("failed to create directory %q: %w", dir, err)
+		}
+	}
+
+	tmpFile := d.filePath + ".tmp"
+	if err := os.WriteFile(tmpFile, data, 0600); err != nil {
+		return fmt.Errorf("failed to write temporary document store file: %w", err)
+	}
+
+	if err := os.Rename(tmpFile, d.filePath); err != nil {
+		_ = os.Remove(tmpFile)
+		return fmt.Errorf("failed to persist document store: %w", err)
+	}
+
+	return nil
 }
 
 // CreateUser persists a user profile and credentials atomically within a single document.
 func (d *NoSQLDAO) CreateUser(ctx context.Context, profile *models.UserProfile, cred *models.UserCredential) (string, error) {
 	if profile == nil || cred == nil {
 		return "", ErrInvalidInput
+	}
+	if strings.TrimSpace(profile.Name) == "" || strings.TrimSpace(profile.Phone) == "" {
+		return "", fmt.Errorf("%w: name and phone are required", ErrInvalidInput)
 	}
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -71,7 +139,12 @@ func (d *NoSQLDAO) CreateUser(ctx context.Context, profile *models.UserProfile, 
 	}
 
 	id := strings.TrimSpace(profile.ID)
-	if id == "" {
+	if id != "" {
+		// Reject duplicate caller-supplied IDs to prevent corrupting indices
+		if _, exists := d.docs[id]; exists {
+			return "", fmt.Errorf("user with ID %q already exists: %w", id, ErrInvalidInput)
+		}
+	} else {
 		id = uuid.New().String()
 	}
 	now := time.Now().UTC()
@@ -97,6 +170,12 @@ func (d *NoSQLDAO) CreateUser(ctx context.Context, profile *models.UserProfile, 
 
 	d.docs[id] = doc
 	d.byUsername[username] = id
+
+	if err := d.persistLocked(); err != nil {
+		delete(d.docs, id)
+		delete(d.byUsername, username)
+		return "", err
+	}
 
 	return id, nil
 }
@@ -127,6 +206,7 @@ func (d *NoSQLDAO) GetProfile(ctx context.Context, userID string) (*models.UserP
 }
 
 // SearchProfiles finds user profiles matching search criteria with pagination.
+// Semantics align with the relational SQL DAO: substring for Name/Phone, exact case-insensitive for Locality/Region/Country.
 func (d *NoSQLDAO) SearchProfiles(ctx context.Context, query models.SearchQuery) ([]*models.UserProfile, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -142,26 +222,28 @@ func (d *NoSQLDAO) SearchProfiles(ctx context.Context, query models.SearchQuery)
 	var matched []*models.UserProfile
 
 	qName := strings.ToLower(strings.TrimSpace(query.Name))
-	qPhone := strings.ToLower(strings.TrimSpace(query.Phone))
-	qLocality := strings.ToLower(strings.TrimSpace(query.Locality))
-	qRegion := strings.ToLower(strings.TrimSpace(query.Region))
-	qCountry := strings.ToLower(strings.TrimSpace(query.Country))
+	qPhone := strings.TrimSpace(query.Phone)
+	qLocality := strings.TrimSpace(query.Locality)
+	qRegion := strings.TrimSpace(query.Region)
+	qCountry := strings.TrimSpace(query.Country)
 
 	for _, doc := range d.docs {
 		p := doc.Profile
+		// Substring matching for Name and Phone
 		if qName != "" && !strings.Contains(strings.ToLower(p.Name), qName) {
 			continue
 		}
-		if qPhone != "" && !strings.Contains(strings.ToLower(p.Phone), qPhone) {
+		if qPhone != "" && !strings.Contains(p.Phone, qPhone) {
 			continue
 		}
-		if qLocality != "" && !strings.Contains(strings.ToLower(p.Address.Locality), qLocality) {
+		// Exact case-insensitive matching for Locality, Region, and Country (matching SQL semantics)
+		if qLocality != "" && !strings.EqualFold(strings.TrimSpace(p.Address.Locality), qLocality) {
 			continue
 		}
-		if qRegion != "" && !strings.Contains(strings.ToLower(p.Address.Region), qRegion) {
+		if qRegion != "" && !strings.EqualFold(strings.TrimSpace(p.Address.Region), qRegion) {
 			continue
 		}
-		if qCountry != "" && !strings.Contains(strings.ToLower(p.Address.Country), qCountry) {
+		if qCountry != "" && !strings.EqualFold(strings.TrimSpace(p.Address.Country), qCountry) {
 			continue
 		}
 		profCopy := p
@@ -259,15 +341,28 @@ func (d *NoSQLDAO) Migrate(ctx context.Context) error {
 		return errors.New("nosql dao is closed")
 	}
 
-	d.indexed = true
+	d.migrated = true
 	return nil
 }
 
 // MigrateUp executes pending migrations or index initialization for the document store.
+// Tracks migration state transitions and returns 0 when already applied.
 func (d *NoSQLDAO) MigrateUp(ctx context.Context) (int, error) {
-	if err := d.Migrate(ctx); err != nil {
+	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.closed {
+		return 0, errors.New("nosql dao is closed")
+	}
+
+	if d.migrated {
+		return 0, nil
+	}
+
+	d.migrated = true
 	return 1, nil
 }
 
@@ -276,12 +371,19 @@ func (d *NoSQLDAO) MigrateDown(ctx context.Context, steps int) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	if d.closed {
 		return 0, errors.New("nosql dao is closed")
 	}
-	return 0, nil
+
+	if !d.migrated || steps < 1 {
+		return 0, nil
+	}
+
+	d.migrated = false
+	return 1, nil
 }
 
 // MigrationVersion returns the current schema version of the document store.
@@ -291,10 +393,15 @@ func (d *NoSQLDAO) MigrationVersion(ctx context.Context) (int64, error) {
 	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+
 	if d.closed {
 		return 0, errors.New("nosql dao is closed")
 	}
-	return 1, nil
+
+	if d.migrated {
+		return 1, nil
+	}
+	return 0, nil
 }
 
 // MigrationStatus returns status information for the NoSQL document collection.
@@ -304,16 +411,23 @@ func (d *NoSQLDAO) MigrationStatus(ctx context.Context) ([]MigrationStatus, erro
 	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+
 	if d.closed {
 		return nil, errors.New("nosql dao is closed")
 	}
-	now := time.Now().UTC()
+
+	var appliedAt *time.Time
+	if d.migrated {
+		now := time.Now().UTC()
+		appliedAt = &now
+	}
+
 	return []MigrationStatus{
 		{
 			Version:   1,
 			Name:      "000001_nosql_document_store",
-			Applied:   d.indexed,
-			AppliedAt: &now,
+			Applied:   d.migrated,
+			AppliedAt: appliedAt,
 		},
 	}, nil
 }
@@ -340,4 +454,3 @@ func (d *NoSQLDAO) Close() error {
 	d.closed = true
 	return nil
 }
-

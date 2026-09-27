@@ -317,6 +317,25 @@ func TestConfigLoad_PersistenceMode(t *testing.T) {
 		}
 	})
 
+	t.Run("alias_canonicalization", func(t *testing.T) {
+		t.Setenv("PERSISTENCE_MODE", "dual-write")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.PersistenceMode != "dual_write" {
+			t.Errorf("expected canonical mode dual_write, got %q", cfg.PersistenceMode)
+		}
+
+		dbCfg, err := LoadDBConfig()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if dbCfg.PersistenceMode != "dual_write" {
+			t.Errorf("expected canonical mode dual_write in dbCfg, got %q", dbCfg.PersistenceMode)
+		}
+	})
+
 	t.Run("invalid_persistence_mode", func(t *testing.T) {
 		t.Setenv("PERSISTENCE_MODE", "invalid_mode_xyz")
 		if _, err := Load(); err == nil {

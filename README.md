@@ -136,7 +136,7 @@ The service includes an embedded, version-tracked database schema migration engi
   ./bin/lid-server migrate down 1
   ```
 ### 8. Multi-Datastore Routing & NoSQL Support (Option B)
-The service supports both relational (SQLite, PostgreSQL, CockroachDB) and document/NoSQL datastores with zero-downtime migration routing:
+The service supports both relational (SQLite, PostgreSQL, CockroachDB) and document/NoSQL datastores with deployment-level persistence routing:
 
 * **Persistence Modes (`PERSISTENCE_MODE`)**:
   * `sql_only` *(default)*: All reads and writes target the primary SQL store.

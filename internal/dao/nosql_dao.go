@@ -101,12 +101,18 @@ func NewNoSQLDAO(dsn string) (*NoSQLDAO, error) {
 			if err := json.Unmarshal(data, &loaded); err != nil {
 				return nil, fmt.Errorf("failed to unmarshal document store from %q: %w", filePath, err)
 			}
-			dao.docs = loaded
+			if loaded == nil {
+				return nil, fmt.Errorf("document store file %q decoded to null, expected document map", filePath)
+			}
 			for id, doc := range loaded {
-				if doc != nil && doc.Credential.Username != "" {
+				if doc == nil {
+					return nil, fmt.Errorf("document store file %q contains null document for user ID %q", filePath, id)
+				}
+				if doc.Credential.Username != "" {
 					dao.byUsername[doc.Credential.Username] = id
 				}
 			}
+			dao.docs = loaded
 		} else if err != nil && !os.IsNotExist(err) {
 			return nil, fmt.Errorf("failed to read document store file %q: %w", filePath, err)
 		}
@@ -284,29 +290,29 @@ func (d *NoSQLDAO) SearchProfiles(ctx context.Context, query models.SearchQuery)
 
 	var matched []*models.UserProfile
 
-	qName := strings.ToLower(strings.TrimSpace(query.Name))
-	qPhone := strings.TrimSpace(query.Phone)
-	qLocality := strings.TrimSpace(query.Locality)
-	qRegion := strings.TrimSpace(query.Region)
-	qCountry := strings.TrimSpace(query.Country)
+	qName := strings.ToLower(query.Name)
+	qPhone := query.Phone
+	qLocality := query.Locality
+	qRegion := query.Region
+	qCountry := query.Country
 
 	for _, doc := range d.docs {
 		p := doc.Profile
-		// Substring matching for Name and Phone
+		// Substring matching for Name and Phone (case-insensitive for name)
 		if qName != "" && !strings.Contains(strings.ToLower(p.Name), qName) {
 			continue
 		}
 		if qPhone != "" && !strings.Contains(p.Phone, qPhone) {
 			continue
 		}
-		// Exact case-insensitive matching for Locality, Region, and Country (matching SQL semantics)
-		if qLocality != "" && !strings.EqualFold(strings.TrimSpace(p.Address.Locality), qLocality) {
+		// Exact case-insensitive matching preserving whitespace for Locality, Region, and Country (matching SQL semantics)
+		if qLocality != "" && !strings.EqualFold(p.Address.Locality, qLocality) {
 			continue
 		}
-		if qRegion != "" && !strings.EqualFold(strings.TrimSpace(p.Address.Region), qRegion) {
+		if qRegion != "" && !strings.EqualFold(p.Address.Region, qRegion) {
 			continue
 		}
-		if qCountry != "" && !strings.EqualFold(strings.TrimSpace(p.Address.Country), qCountry) {
+		if qCountry != "" && !strings.EqualFold(p.Address.Country, qCountry) {
 			continue
 		}
 		profCopy := p
@@ -331,6 +337,8 @@ func (d *NoSQLDAO) SearchProfiles(ctx context.Context, query models.SearchQuery)
 	offset := query.Offset
 	if offset < 0 {
 		offset = 0
+	} else if offset > 10000 {
+		offset = 10000
 	}
 	if offset >= len(matched) {
 		return []*models.UserProfile{}, nil

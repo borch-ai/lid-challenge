@@ -3,6 +3,7 @@ package dao
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -363,6 +364,18 @@ func TestNoSQLDAO_SearchProfiles_ExactMatchSemantics(t *testing.T) {
 	if err != nil || len(resEmpty) != 0 {
 		t.Fatalf("expected empty slice when offset out of range, got %v", resEmpty)
 	}
+
+	// Offset > 10000 clamped to 10000
+	resClamped, err := store.SearchProfiles(ctx, models.SearchQuery{Offset: 20000})
+	if err != nil || len(resClamped) != 0 {
+		t.Fatalf("expected empty slice for clamped offset, got %v", resClamped)
+	}
+
+	// Whitespace preservation: query with whitespace does not match trimmed value in DB
+	resWS, err := store.SearchProfiles(ctx, models.SearchQuery{Locality: " denver "})
+	if err != nil || len(resWS) != 0 {
+		t.Fatalf("expected 0 results when query has leading/trailing whitespace, got %d", len(resWS))
+	}
 }
 
 func TestNoSQLDAO_FilePersistence(t *testing.T) {
@@ -409,6 +422,24 @@ func TestNoSQLDAO_FilePersistence(t *testing.T) {
 	authed, err := store2.VerifyUserCredential(ctx, "persist_user", "persistpass")
 	if err != nil || authed.ID != id {
 		t.Fatalf("expected successful credential verification from reloaded disk file, got: %v, err: %v", authed, err)
+	}
+
+	// Phase 3: Reject null JSON decoded content
+	nullFile := filepath.Join(tmpDir, "null.json")
+	if err := os.WriteFile(nullFile, []byte("null"), 0600); err != nil {
+		t.Fatalf("failed to write null file: %v", err)
+	}
+	if _, err := NewNoSQLDAO(nullFile); err == nil {
+		t.Error("expected error loading JSON file decoding to null map, got nil")
+	}
+
+	// Phase 4: Reject null document entries within document map
+	nullDocFile := filepath.Join(tmpDir, "nulldoc.json")
+	if err := os.WriteFile(nullDocFile, []byte(`{"user1": null}`), 0600); err != nil {
+		t.Fatalf("failed to write nulldoc file: %v", err)
+	}
+	if _, err := NewNoSQLDAO(nullDocFile); err == nil {
+		t.Error("expected error loading JSON file containing null document, got nil")
 	}
 }
 

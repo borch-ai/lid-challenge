@@ -378,16 +378,30 @@ func (r *RoutingDAO) MigrateUp(ctx context.Context) (int, error) {
 	return count, nil
 }
 
-// MigrateDown rolls back migrations on the active primary datastore.
+// MigrateDown rolls back migrations on both the active primary and secondary datastores.
 func (r *RoutingDAO) MigrateDown(ctx context.Context, steps int) (int, error) {
 	r.mu.RLock()
-	primary, _ := r.targets()
+	primary, secondary := r.targets()
 	r.mu.RUnlock()
 
+	var count int
 	if m, ok := primary.(MigratableDAO); ok {
-		return m.MigrateDown(ctx, steps)
+		var err error
+		count, err = m.MigrateDown(ctx, steps)
+		if err != nil {
+			return count, err
+		}
 	}
-	return 0, nil
+
+	if secondary != nil {
+		if m, ok := secondary.(MigratableDAO); ok {
+			if _, err := m.MigrateDown(ctx, steps); err != nil {
+				return count, fmt.Errorf("secondary datastore migrate down failed: %w", err)
+			}
+		}
+	}
+
+	return count, nil
 }
 
 // MigrationVersion returns the schema version of the active primary datastore.

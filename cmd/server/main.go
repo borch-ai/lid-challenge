@@ -41,16 +41,41 @@ func initUserDAO(driver, dsn string) (dao.UserDAO, error) {
 	}
 }
 
-func buildRoutingDAO(mode dao.PersistenceMode, driver1 string, dao1 dao.UserDAO, driver2 string, dao2 dao.UserDAO, logger *slog.Logger) (*dao.RoutingDAO, error) {
-	isNoSQL1 := isNoSQLDriver(driver1)
-	isNoSQL2 := isNoSQLDriver(driver2)
-	if isNoSQL1 == isNoSQL2 {
-		if isNoSQL1 {
-			return nil, fmt.Errorf("dual-write persistence mode requires one SQL driver and one NoSQL driver; both %q and %q are NoSQL drivers", driver1, driver2)
-		}
-		return nil, fmt.Errorf("dual-write persistence mode requires one SQL driver and one NoSQL driver; both %q and %q are SQL drivers", driver1, driver2)
+func validatePersistenceConfig(modeStr, primaryDriver, secondaryDriver string) error {
+	mode, err := dao.ParsePersistenceMode(modeStr)
+	if err != nil {
+		return err
 	}
-	if isNoSQL1 && !isNoSQL2 {
+	switch mode {
+	case dao.PersistenceModeSQLOnly:
+		if isNoSQLDriver(primaryDriver) {
+			return fmt.Errorf("persistence mode %q requires a SQL primary driver, but primary driver is %q", mode, primaryDriver)
+		}
+	case dao.PersistenceModeNoSQLOnly:
+		if !isNoSQLDriver(primaryDriver) {
+			return fmt.Errorf("persistence mode %q requires a NoSQL primary driver, but primary driver is %q", mode, primaryDriver)
+		}
+	case dao.PersistenceModeDualWrite, dao.PersistenceModeDualWriteNoSQLPrimary:
+		if secondaryDriver == "" {
+			return fmt.Errorf("secondary database driver must be configured when dual-write persistence mode (%s) is active", mode)
+		}
+		isNoSQL1 := isNoSQLDriver(primaryDriver)
+		isNoSQL2 := isNoSQLDriver(secondaryDriver)
+		if isNoSQL1 == isNoSQL2 {
+			if isNoSQL1 {
+				return fmt.Errorf("dual-write persistence mode requires one SQL driver and one NoSQL driver; both %q and %q are NoSQL drivers", primaryDriver, secondaryDriver)
+			}
+			return fmt.Errorf("dual-write persistence mode requires one SQL driver and one NoSQL driver; both %q and %q are SQL drivers", primaryDriver, secondaryDriver)
+		}
+	}
+	return nil
+}
+
+func buildRoutingDAO(mode dao.PersistenceMode, driver1 string, dao1 dao.UserDAO, driver2 string, dao2 dao.UserDAO, logger *slog.Logger) (*dao.RoutingDAO, error) {
+	if err := validatePersistenceConfig(string(mode), driver1, driver2); err != nil {
+		return nil, err
+	}
+	if isNoSQLDriver(driver1) && !isNoSQLDriver(driver2) {
 		// driver1 is NoSQL, driver2 is SQL
 		return dao.NewRoutingDAO(mode, dao2, dao1, logger)
 	}
@@ -74,6 +99,11 @@ func main() {
 		logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: logLevel,
 		}))
+
+		if err := validatePersistenceConfig(dbCfg.PersistenceMode, dbCfg.Driver, dbCfg.SecondaryDriver); err != nil {
+			logger.Error("invalid persistence configuration", slog.Any("error", err))
+			os.Exit(1)
+		}
 
 		primaryDAO, err := initUserDAO(dbCfg.Driver, dbCfg.DSN)
 		if err != nil {
@@ -130,6 +160,11 @@ func main() {
 		slog.String("persistence_mode", cfg.PersistenceMode),
 		slog.Int("port", cfg.Server.Port),
 	)
+
+	if err := validatePersistenceConfig(cfg.PersistenceMode, cfg.DBDriver, cfg.SecondaryDBDriver); err != nil {
+		logger.Error("invalid persistence configuration", slog.Any("error", err))
+		os.Exit(1)
+	}
 
 	// Initialize primary database DAO based on driver
 	primaryDAO, err := initUserDAO(cfg.DBDriver, cfg.DBDSN)

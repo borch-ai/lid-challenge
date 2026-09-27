@@ -171,7 +171,7 @@ func (m *mockErrorDAO) MigrateUp(ctx context.Context) (int, error) {
 }
 
 func (m *mockErrorDAO) MigrateDown(ctx context.Context, steps int) (int, error) {
-	return 0, nil
+	return 0, m.migrateErr
 }
 
 func (m *mockErrorDAO) MigrationVersion(ctx context.Context) (int64, error) {
@@ -531,6 +531,14 @@ func TestRoutingDAO_ErrorDelegation(t *testing.T) {
 	}
 	if _, err := r2.MigrateUp(ctx); err == nil {
 		t.Error("expected error on secondary migrate up failure")
+	}
+
+	// Migrate down failures
+	if _, err := r1.MigrateDown(ctx, 1); err == nil {
+		t.Error("expected error on primary migrate down failure")
+	}
+	if _, err := r2.MigrateDown(ctx, 1); err == nil {
+		t.Error("expected error on secondary migrate down failure")
 	}
 
 	// Ping failures

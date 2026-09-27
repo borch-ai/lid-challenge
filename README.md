@@ -145,16 +145,27 @@ The service supports both relational (SQLite, PostgreSQL, CockroachDB) and docum
   * `nosql_only`: All reads and writes target the NoSQL store.
 * **Environment Configuration**:
   ```bash
-  # Standalone NoSQL mode
-  APP_ENV=development DB_DRIVER=nosql go run ./cmd/server/main.go
+  # Standalone NoSQL mode (in-memory or file-backed JSON document store)
+  APP_ENV=development \
+    PERSISTENCE_MODE=nosql_only \
+    DB_DRIVER=nosql DB_DSN="lid_nosql.json" \
+    go run ./cmd/server/main.go
+
+  # Standalone NoSQL mode (pure in-memory)
+  APP_ENV=development \
+    PERSISTENCE_MODE=nosql_only \
+    DB_DRIVER=nosql DB_DSN="memory://" \
+    go run ./cmd/server/main.go
 
   # Dual-write mode (SQL primary with NoSQL secondary replica)
   APP_ENV=development \
     DB_DRIVER=sqlite DB_DSN="lid.db" \
     PERSISTENCE_MODE=dual_write \
-    SECONDARY_DB_DRIVER=nosql SECONDARY_DB_DSN="memory://" \
+    SECONDARY_DB_DRIVER=nosql SECONDARY_DB_DSN="lid_nosql.json" \
     go run ./cmd/server/main.go
   ```
+* **Single-Process Scope & Production Scalability**:
+  File-backed NoSQL storage uses reload/merge semantics and process-isolated temporary files (`.tmp.<pid>.<ts>`), designed for single-process embedded deployments, local testing, and development. For multi-replica production environments requiring distributed concurrent writes, configure a networked datastore (PostgreSQL/CockroachDB).
 * **Future Option A Roadmap**: See [`TODO.md`](TODO.md) for dynamic feature flags (OpenFeature), live shadow reads, outbox CDC, and automated canary rollouts.
 
 ---

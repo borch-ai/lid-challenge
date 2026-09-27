@@ -147,6 +147,48 @@ func TestBuildRoutingDAO(t *testing.T) {
 	}
 }
 
+func TestValidatePersistenceConfig(t *testing.T) {
+	// Valid configs
+	if err := validatePersistenceConfig("sql_only", "sqlite", ""); err != nil {
+		t.Errorf("expected valid sql_only config, got: %v", err)
+	}
+	if err := validatePersistenceConfig("nosql_only", "nosql", ""); err != nil {
+		t.Errorf("expected valid nosql_only config, got: %v", err)
+	}
+	if err := validatePersistenceConfig("dual_write", "sqlite", "nosql"); err != nil {
+		t.Errorf("expected valid dual_write config, got: %v", err)
+	}
+	if err := validatePersistenceConfig("dual_write_nosql_primary", "nosql", "postgres"); err != nil {
+		t.Errorf("expected valid dual_write_nosql_primary config, got: %v", err)
+	}
+
+	// Invalid configs
+	// 1. sql_only with NoSQL driver
+	if err := validatePersistenceConfig("sql_only", "nosql", ""); err == nil {
+		t.Error("expected error for sql_only with nosql driver, got nil")
+	}
+	// 2. nosql_only with SQL driver
+	if err := validatePersistenceConfig("nosql_only", "sqlite", ""); err == nil {
+		t.Error("expected error for nosql_only with sqlite driver, got nil")
+	}
+	// 3. dual_write without secondary driver
+	if err := validatePersistenceConfig("dual_write", "sqlite", ""); err == nil {
+		t.Error("expected error for dual_write without secondary driver, got nil")
+	}
+	// 4. dual_write with both SQL drivers
+	if err := validatePersistenceConfig("dual_write", "sqlite", "postgres"); err == nil {
+		t.Error("expected error for dual_write with two SQL drivers, got nil")
+	}
+	// 5. dual_write with both NoSQL drivers
+	if err := validatePersistenceConfig("dual_write", "nosql", "memory"); err == nil {
+		t.Error("expected error for dual_write with two NoSQL drivers, got nil")
+	}
+	// 6. Unknown persistence mode
+	if err := validatePersistenceConfig("unknown_mode", "sqlite", ""); err == nil {
+		t.Error("expected error for unknown persistence mode, got nil")
+	}
+}
+
 func TestRunMigrationCLI_NoSQLAndRoutingDAO(t *testing.T) {
 	nosqlDAO, err := dao.NewNoSQLDAO("")
 	if err != nil {

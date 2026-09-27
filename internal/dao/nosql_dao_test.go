@@ -236,8 +236,11 @@ func TestNoSQLDAO_CreateAndRetrieve(t *testing.T) {
 	if _, err := store.GetCredential(ctx, "nonexistent"); !errors.Is(err, ErrUserNotFound) {
 		t.Errorf("expected ErrUserNotFound, got %v", err)
 	}
-	if _, err := store.GetCredential(ctx, "   "); !errors.Is(err, ErrUserNotFound) {
-		t.Errorf("expected ErrUserNotFound for blank username, got %v", err)
+	if _, err := store.GetCredential(ctx, "   "); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput for blank username, got %v", err)
+	}
+	if _, err := store.GetCredential(ctx, ""); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput for empty username, got %v", err)
 	}
 
 	// VerifyUserCredential tests
@@ -254,6 +257,32 @@ func TestNoSQLDAO_CreateAndRetrieve(t *testing.T) {
 	}
 	if _, err := store.VerifyUserCredential(ctx, "nonexistent", "pass"); !errors.Is(err, ErrUserNotFound) {
 		t.Errorf("expected ErrUserNotFound, got %v", err)
+	}
+	if _, err := store.VerifyUserCredential(ctx, "   ", "pass"); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput for blank username, got %v", err)
+	}
+	if _, err := store.VerifyUserCredential(ctx, "alice_wonder", "   "); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput for blank password, got %v", err)
+	}
+
+	// Credential method validation and defaulting
+	unsupportedCred := &models.UserCredential{Username: "unsupported", PasswordHash: hash, Method: "md5"}
+	unsupportedProf := &models.UserProfile{Name: "Unsupported", Phone: "+1-555-9999"}
+	if _, err := store.CreateUser(ctx, unsupportedProf, unsupportedCred); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput for unsupported credential method, got %v", err)
+	}
+
+	// Untrimmed username semantics matching SQL DAO
+	untrimmedCred := &models.UserCredential{Username: " alice_untrimmed ", PasswordHash: hash}
+	untrimmedProf := &models.UserProfile{Name: "Untrimmed", Phone: "+1-555-8888"}
+	if _, err := store.CreateUser(ctx, untrimmedProf, untrimmedCred); err != nil {
+		t.Fatalf("failed to create user with untrimmed username: %v", err)
+	}
+	if _, err := store.GetCredential(ctx, "alice_untrimmed"); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("expected ErrUserNotFound when querying trimmed variant of untrimmed username")
+	}
+	if fetched, err := store.GetCredential(ctx, " alice_untrimmed "); err != nil || fetched.Username != " alice_untrimmed " {
+		t.Errorf("expected successful retrieval with exact untrimmed username, got %v, err %v", fetched, err)
 	}
 }
 

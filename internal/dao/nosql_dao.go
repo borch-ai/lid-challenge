@@ -13,9 +13,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/borch-ai/lid-challenge/internal/models"
 	"github.com/borch-ai/lid-challenge/internal/security"
+	"github.com/google/uuid"
 )
 
 // storageCredential persists user credentials including the hashed password on disk.
@@ -76,6 +76,9 @@ type NoSQLDAO struct {
 // NewNoSQLDAO creates a new NoSQLDAO document store instance.
 // If dsn is empty, "memory", ":memory:", or starts with "memory://", data is held in-memory.
 // Otherwise, dsn is treated as a file path (or file:// URI) for durable document persistence.
+// Note: File-backed NoSQL mode is designed for single-process embedded deployments, local
+// development, and automated testing. For multi-replica production deployments requiring
+// distributed concurrent writes, configure a networked datastore (PostgreSQL/CockroachDB).
 func NewNoSQLDAO(dsn string) (*NoSQLDAO, error) {
 	trimmed := strings.TrimSpace(dsn)
 	var filePath string
@@ -117,24 +120,47 @@ func (d *NoSQLDAO) persistLocked() error {
 		return nil
 	}
 
+	cleanPath := filepath.Clean(d.filePath)
+
+	// Reload and merge any existing documents on disk to prevent lost writes
+	// across processes or separate instances accessing the same file.
+	if diskData, err := os.ReadFile(cleanPath); err == nil && len(diskData) > 0 {
+		var diskDocs map[string]*userDocument
+		if err := json.Unmarshal(diskData, &diskDocs); err == nil {
+			for id, diskDoc := range diskDocs {
+				if diskDoc == nil {
+					continue
+				}
+				existing, exists := d.docs[id]
+				if !exists || diskDoc.UpdatedAt.After(existing.UpdatedAt) {
+					d.docs[id] = diskDoc
+					if diskDoc.Credential.Username != "" {
+						d.byUsername[diskDoc.Credential.Username] = id
+					}
+				}
+			}
+		}
+	}
+
 	data, err := json.MarshalIndent(d.docs, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal document store: %w", err)
 	}
 
-	dir := filepath.Dir(d.filePath)
+	dir := filepath.Dir(cleanPath)
 	if dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0750); err != nil {
 			return fmt.Errorf("failed to create directory %q: %w", dir, err)
 		}
 	}
 
-	tmpFile := d.filePath + ".tmp"
+	// Use PID and nanosecond timestamp to eliminate race conditions on temporary files
+	tmpFile := fmt.Sprintf("%s.%d.%d.tmp", cleanPath, os.Getpid(), time.Now().UnixNano())
 	if err := os.WriteFile(tmpFile, data, 0600); err != nil {
 		return fmt.Errorf("failed to write temporary document store file: %w", err)
 	}
 
-	if err := os.Rename(tmpFile, d.filePath); err != nil {
+	if err := os.Rename(tmpFile, cleanPath); err != nil {
 		_ = os.Remove(tmpFile)
 		return fmt.Errorf("failed to persist document store: %w", err)
 	}
@@ -161,13 +187,12 @@ func (d *NoSQLDAO) CreateUser(ctx context.Context, profile *models.UserProfile, 
 		return "", errors.New("nosql dao is closed")
 	}
 
-	username := strings.TrimSpace(cred.Username)
-	if username == "" {
-		return "", ErrInvalidInput
+	if strings.TrimSpace(cred.Username) == "" || strings.TrimSpace(cred.PasswordHash) == "" {
+		return "", fmt.Errorf("%w: username and password_hash are required", ErrInvalidInput)
 	}
 
-	// Enforce unique secondary index on username
-	if _, exists := d.byUsername[username]; exists {
+	// Enforce unique secondary index on username (preserving original string without trimming)
+	if _, exists := d.byUsername[cred.Username]; exists {
 		return "", ErrUsernameTaken
 	}
 
@@ -189,9 +214,14 @@ func (d *NoSQLDAO) CreateUser(ctx context.Context, profile *models.UserProfile, 
 
 	credCopy := *cred
 	credCopy.UserID = id
-	credCopy.Username = username
 	credCopy.CreatedAt = now
 	credCopy.UpdatedAt = now
+
+	if credCopy.Method == "" {
+		credCopy.Method = security.DefaultHashMethod
+	} else if credCopy.Method != security.DefaultHashMethod {
+		return "", fmt.Errorf("%w: unsupported credential hash method %q", ErrInvalidInput, cred.Method)
+	}
 
 	doc := &userDocument{
 		ID:         id,
@@ -202,11 +232,11 @@ func (d *NoSQLDAO) CreateUser(ctx context.Context, profile *models.UserProfile, 
 	}
 
 	d.docs[id] = doc
-	d.byUsername[username] = id
+	d.byUsername[cred.Username] = id
 
 	if err := d.persistLocked(); err != nil {
 		delete(d.docs, id)
-		delete(d.byUsername, username)
+		delete(d.byUsername, cred.Username)
 		return "", err
 	}
 
@@ -319,9 +349,8 @@ func (d *NoSQLDAO) GetCredential(ctx context.Context, username string) (*models.
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	uname := strings.TrimSpace(username)
-	if uname == "" {
-		return nil, ErrUserNotFound
+	if strings.TrimSpace(username) == "" {
+		return nil, ErrInvalidInput
 	}
 
 	d.mu.RLock()
@@ -331,7 +360,7 @@ func (d *NoSQLDAO) GetCredential(ctx context.Context, username string) (*models.
 		return nil, errors.New("nosql dao is closed")
 	}
 
-	userID, exists := d.byUsername[uname]
+	userID, exists := d.byUsername[username]
 	if !exists {
 		return nil, ErrUserNotFound
 	}
@@ -349,6 +378,9 @@ func (d *NoSQLDAO) GetCredential(ctx context.Context, username string) (*models.
 func (d *NoSQLDAO) VerifyUserCredential(ctx context.Context, username, password string) (*models.UserProfile, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if strings.TrimSpace(username) == "" || strings.TrimSpace(password) == "" {
+		return nil, ErrInvalidInput
 	}
 	cred, err := d.GetCredential(ctx, username)
 	if err != nil {

@@ -139,10 +139,14 @@ The service includes an embedded, version-tracked database schema migration engi
 The service supports both relational (SQLite, PostgreSQL, CockroachDB) and document/NoSQL datastores with deployment-level persistence routing:
 
 * **Persistence Modes (`PERSISTENCE_MODE`)**:
-  * `sql_only` *(default)*: All reads and writes target the primary SQL store.
-  * `dual_write`: Primary is SQL; successful writes synchronously replicate to the secondary NoSQL store with fault isolation. Reads are served by SQL.
-  * `dual_write_nosql_primary`: Primary is NoSQL; successful writes synchronously replicate to the secondary SQL store with fault isolation. Reads are served by NoSQL.
-  * `nosql_only`: All reads and writes target the NoSQL store.
+  * `sql_only` *(default)*: All writes target the primary SQL store. If a secondary NoSQL datastore is configured, missing point reads fall back to NoSQL and profile searches merge and deduplicate across both backends.
+  * `dual_write`: Primary is SQL; successful writes synchronously replicate to the secondary NoSQL store with fault isolation. Point reads are served by SQL with fallback to NoSQL on misses, and profile searches merge and deduplicate across both backends.
+  * `dual_write_nosql_primary`: Primary is NoSQL; successful writes synchronously replicate to the secondary SQL store with fault isolation. Point reads are served by NoSQL with fallback to SQL on misses, and profile searches merge and deduplicate across both backends.
+  * `nosql_only`: All writes target the primary NoSQL store. If a secondary SQL datastore is configured, missing point reads fall back to SQL and profile searches merge and deduplicate across both backends.
+* **Pre-Backfill Read Fallback & Search Merge Semantics**:
+  To protect against data unavailability during phased database cutovers prior to historical data backfill completion:
+  * **Point Reads (`GetProfile`, `GetCredential`, `VerifyUserCredential`)**: Executed against the primary store; if the record is missing and an alternate datastore is configured, the router queries the alternate store as a fallback.
+  * **Search Queries (`SearchProfiles`)**: When both datastores are configured, searches query both backends in bounded pages, merge and deduplicate matching records by user ID (preserving primary records on collision), sort deterministically (`CreatedAt DESC, id DESC`), and apply pagination offset/limit.
 * **Environment Configuration**:
   ```bash
   # Standalone NoSQL mode (in-memory or file-backed JSON document store)

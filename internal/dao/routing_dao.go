@@ -290,6 +290,9 @@ func fetchUpTo(ctx context.Context, d UserDAO, baseQuery models.SearchQuery, tar
 	currentOffset := 0
 
 	for len(all) < targetCount {
+		if err := ctx.Err(); err != nil {
+			return all, err
+		}
 		needed := targetCount - len(all)
 		pageSize := needed
 		if pageSize > maxBackendPage {
@@ -323,6 +326,10 @@ func fetchUpTo(ctx context.Context, d UserDAO, baseQuery models.SearchQuery, tar
 // SearchProfiles finds user profiles matching search criteria using the active primary datastore,
 // merging and deduplicating results from the alternate datastore when both datastores are configured.
 func (r *RoutingDAO) SearchProfiles(ctx context.Context, query models.SearchQuery) ([]*models.UserProfile, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	r.mu.RLock()
 	primary, _ := r.targets()
 	fallback := r.fallback()
@@ -358,8 +365,15 @@ func (r *RoutingDAO) SearchProfiles(ctx context.Context, query models.SearchQuer
 		return nil, err
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	fallbackResults, fallbackErr := fetchUpTo(ctx, fallback, query, targetCount)
 	if fallbackErr != nil {
+		if ctx.Err() != nil || errors.Is(fallbackErr, context.Canceled) || errors.Is(fallbackErr, context.DeadlineExceeded) {
+			return nil, fallbackErr
+		}
 		logger.Warn("alternate datastore search query failed during search merge",
 			slog.String("operation", "SearchProfiles"),
 			slog.Any("error", fallbackErr),

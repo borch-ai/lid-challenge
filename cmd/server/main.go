@@ -75,13 +75,17 @@ func validatePersistenceModeDrivers(mode dao.PersistenceMode, primaryDriver, sec
 	return nil
 }
 
-func validatePersistenceConfig(modeStr, primaryDriver, secondaryDriver, secondaryDSN string) error {
+func validatePersistenceConfig(modeStr, primaryDriver, primaryDSN, secondaryDriver, secondaryDSN string) error {
 	mode, err := dao.ParsePersistenceMode(modeStr)
 	if err != nil {
 		return err
 	}
 	if err := validatePersistenceModeDrivers(mode, primaryDriver, secondaryDriver); err != nil {
 		return err
+	}
+	trimmedPriDriver := strings.ToLower(strings.TrimSpace(primaryDriver))
+	if trimmedPriDriver != "" && trimmedPriDriver != "memory" && strings.TrimSpace(primaryDSN) == "" {
+		return fmt.Errorf("primary database DSN must be configured for primary driver %q (use %q driver for explicit in-memory storage)", primaryDriver, "memory")
 	}
 	trimmedSecDriver := strings.ToLower(strings.TrimSpace(secondaryDriver))
 	if trimmedSecDriver != "" && trimmedSecDriver != "memory" && strings.TrimSpace(secondaryDSN) == "" {
@@ -135,7 +139,7 @@ func main() {
 			Level: logLevel,
 		}))
 
-		if err := validatePersistenceConfig(dbCfg.PersistenceMode, dbCfg.Driver, dbCfg.SecondaryDriver, dbCfg.SecondaryDSN); err != nil {
+		if err := validatePersistenceConfig(dbCfg.PersistenceMode, dbCfg.Driver, dbCfg.DSN, dbCfg.SecondaryDriver, dbCfg.SecondaryDSN); err != nil {
 			logger.Error("invalid persistence configuration", slog.Any("error", err))
 			os.Exit(1)
 		}
@@ -196,7 +200,7 @@ func main() {
 		slog.Int("port", cfg.Server.Port),
 	)
 
-	if err := validatePersistenceConfig(cfg.PersistenceMode, cfg.DBDriver, cfg.SecondaryDBDriver, cfg.SecondaryDBDSN); err != nil {
+	if err := validatePersistenceConfig(cfg.PersistenceMode, cfg.DBDriver, cfg.DBDSN, cfg.SecondaryDBDriver, cfg.SecondaryDBDSN); err != nil {
 		logger.Error("invalid persistence configuration", slog.Any("error", err))
 		os.Exit(1)
 	}

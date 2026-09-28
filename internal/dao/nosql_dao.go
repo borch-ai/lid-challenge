@@ -150,12 +150,18 @@ type NoSQLDAO struct {
 func NewNoSQLDAO(dsn string) (*NoSQLDAO, error) {
 	trimmed := strings.TrimSpace(dsn)
 	var filePath string
-	if trimmed != "" && trimmed != "memory" && trimmed != ":memory:" && !strings.HasPrefix(trimmed, "memory://") {
+	if trimmed != "" && trimmed != "memory" && trimmed != ":memory:" && trimmed != "memory://" {
+		if strings.HasPrefix(trimmed, "memory://") {
+			return nil, fmt.Errorf("invalid memory DSN %q: expected 'memory', ':memory:', or 'memory://'", dsn)
+		}
 		if strings.HasPrefix(trimmed, "file://") {
 			filePath = strings.TrimPrefix(trimmed, "file://")
-			if strings.TrimSpace(filePath) == "" {
+			filePath = strings.TrimSpace(filePath)
+			if filePath == "" || filePath == "/" {
 				return nil, fmt.Errorf("invalid file DSN %q: empty file path", dsn)
 			}
+		} else if strings.Contains(trimmed, "://") {
+			return nil, fmt.Errorf("unsupported DSN scheme in %q: only 'file://' and 'memory://' are supported for NoSQL", dsn)
 		} else {
 			filePath = trimmed
 		}
@@ -337,9 +343,19 @@ func (d *NoSQLDAO) CreateUser(ctx context.Context, profile *models.UserProfile, 
 	// For file-backed DAO, reload disk state to incorporate documents and usernames persisted by other instances.
 	if d.filePath != "" {
 		cleanPath := filepath.Clean(d.filePath)
-		if err := d.mergeFromDiskLocked(cleanPath, d.docs, d.byUsername, false, ""); err != nil {
+		candidateDocs := make(map[string]*userDocument, len(d.docs))
+		for k, v := range d.docs {
+			candidateDocs[k] = v
+		}
+		candidateByUsername := make(map[string]string, len(d.byUsername))
+		for k, v := range d.byUsername {
+			candidateByUsername[k] = v
+		}
+		if err := d.mergeFromDiskLocked(cleanPath, candidateDocs, candidateByUsername, false, ""); err != nil {
 			return "", err
 		}
+		d.docs = candidateDocs
+		d.byUsername = candidateByUsername
 	}
 
 	if strings.TrimSpace(cred.Username) == "" || strings.TrimSpace(cred.PasswordHash) == "" {

@@ -663,10 +663,59 @@ func TestNoSQLDAO_ContextCancelledAndClosedErrors(t *testing.T) {
 }
 
 func TestNoSQLDAO_MalformedFileDSN(t *testing.T) {
-	for _, badDSN := range []string{"file://", "file://  ", "file://\t"} {
+	for _, badDSN := range []string{
+		"file://",
+		"file://  ",
+		"file://\t",
+		"file:///",
+		"memory://invalid",
+		"postgres://user:pass@localhost/db",
+		"sqlite://lid.db",
+	} {
 		if _, err := NewNoSQLDAO(badDSN); err == nil {
-			t.Errorf("expected error for malformed file DSN %q, got nil", badDSN)
+			t.Errorf("expected error for malformed or unsupported DSN %q, got nil", badDSN)
 		}
+	}
+}
+
+func TestNoSQLDAO_CreateUser_ReloadAtomicityOnDiskCorruption(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "atomicity_test.json")
+
+	store, err := NewNoSQLDAO(filePath)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	hash, _ := security.HashPassword("pass")
+	p := &models.UserProfile{ID: "local-user", Name: "Local User", Phone: "111"}
+	c := &models.UserCredential{Username: "local_user", PasswordHash: hash}
+	if _, err := store.CreateUser(ctx, p, c); err != nil {
+		t.Fatalf("failed to create initial user: %v", err)
+	}
+
+	// Corrupt file on disk
+	if err := os.WriteFile(filePath, []byte("invalid-json{[["), 0600); err != nil {
+		t.Fatalf("failed to write corrupt file: %v", err)
+	}
+
+	// CreateUser triggers reload which encounters the corrupted disk file
+	p2 := &models.UserProfile{ID: "local-user-2", Name: "Local User 2", Phone: "222"}
+	c2 := &models.UserCredential{Username: "local_user_2", PasswordHash: hash}
+	if _, err := store.CreateUser(ctx, p2, c2); err == nil {
+		t.Fatal("expected CreateUser to fail due to corrupted disk file during reload, got nil")
+	}
+
+	// Verify in-memory state is completely uncorrupted: local_user is still accessible
+	prof, err := store.GetProfile(ctx, "local-user")
+	if err != nil || prof.Name != "Local User" {
+		t.Errorf("expected local-user profile to be intact, got prof %v, err %v", prof, err)
+	}
+	cred, err := store.GetCredential(ctx, "local_user")
+	if err != nil || cred.UserID != "local-user" {
+		t.Errorf("expected local_user credential to be intact, got cred %v, err %v", cred, err)
 	}
 }
 

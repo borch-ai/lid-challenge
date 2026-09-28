@@ -1034,6 +1034,42 @@ func TestRoutingDAO_SearchProfiles_ErrorAndEdgeCases(t *testing.T) {
 	}
 }
 
+func TestRoutingDAO_SearchProfiles_ContextCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel context
+
+	nosqlDAO, err := NewNoSQLDAO("")
+	if err != nil {
+		t.Fatalf("failed to create nosql dao: %v", err)
+	}
+	defer func() { _ = nosqlDAO.Close() }()
+
+	sqlDAO, err := NewSQLiteDAO("file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("failed to create sqlite dao: %v", err)
+	}
+	defer func() { _ = sqlDAO.Close() }()
+
+	r, err := NewRoutingDAO(PersistenceModeDualWrite, sqlDAO, nosqlDAO, nil)
+	if err != nil {
+		t.Fatalf("failed to create routing dao: %v", err)
+	}
+
+	if _, err := r.SearchProfiles(ctx, models.SearchQuery{}); !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled on pre-canceled context, got: %v", err)
+	}
+
+	// Test cancellation during fallback query
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+
+	fallbackCanceled := &mockErrorDAO{searchErr: context.Canceled}
+	rFallbackCanceled, _ := NewRoutingDAO(PersistenceModeDualWriteNoSQLPrimary, fallbackCanceled, nosqlDAO, nil)
+	if _, err := rFallbackCanceled.SearchProfiles(ctx2, models.SearchQuery{}); !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled propagated from fallback, got: %v", err)
+	}
+}
+
 
 
 

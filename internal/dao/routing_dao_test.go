@@ -146,6 +146,10 @@ type mockErrorDAO struct {
 	migrateErr error
 	pingErr    error
 	closeErr   error
+	searchErr  error
+	getProfErr error
+	getCredErr error
+	verifyErr  error
 	upCount    int
 	downCount  int
 }
@@ -155,6 +159,34 @@ func (m *mockErrorDAO) CreateUser(ctx context.Context, profile *models.UserProfi
 		return "", m.createErr
 	}
 	return "mock-id", nil
+}
+
+func (m *mockErrorDAO) SearchProfiles(ctx context.Context, query models.SearchQuery) ([]*models.UserProfile, error) {
+	if m.searchErr != nil {
+		return nil, m.searchErr
+	}
+	return nil, nil
+}
+
+func (m *mockErrorDAO) GetProfile(ctx context.Context, userID string) (*models.UserProfile, error) {
+	if m.getProfErr != nil {
+		return nil, m.getProfErr
+	}
+	return nil, ErrUserNotFound
+}
+
+func (m *mockErrorDAO) GetCredential(ctx context.Context, username string) (*models.UserCredential, error) {
+	if m.getCredErr != nil {
+		return nil, m.getCredErr
+	}
+	return nil, ErrUserNotFound
+}
+
+func (m *mockErrorDAO) VerifyUserCredential(ctx context.Context, username, password string) (*models.UserProfile, error) {
+	if m.verifyErr != nil {
+		return nil, m.verifyErr
+	}
+	return nil, ErrUserNotFound
 }
 
 func (m *mockErrorDAO) Migrate(ctx context.Context) error {
@@ -920,6 +952,88 @@ func TestRoutingDAO_SearchProfiles_ExceedsSinglePageCap(t *testing.T) {
 		t.Fatalf("expected 20 items for offset 100 and limit 20 beyond 100-page cap, got %d", len(pageResults))
 	}
 }
+
+func TestRoutingDAO_SearchProfiles_ErrorAndEdgeCases(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Router with no primary configured
+	emptyRouter := &RoutingDAO{}
+	if _, err := emptyRouter.SearchProfiles(ctx, models.SearchQuery{}); err == nil {
+		t.Error("expected error when searching profiles with no primary configured")
+	}
+	if _, err := emptyRouter.GetProfile(ctx, "any"); err == nil {
+		t.Error("expected error when getting profile with no primary configured")
+	}
+	if _, err := emptyRouter.GetCredential(ctx, "any"); err == nil {
+		t.Error("expected error when getting credential with no primary configured")
+	}
+	if _, err := emptyRouter.VerifyUserCredential(ctx, "any", "pw"); err == nil {
+		t.Error("expected error when verifying credential with no primary configured")
+	}
+
+	// 2. Primary fails on search
+	primaryFail := &mockErrorDAO{searchErr: errors.New("primary boom")}
+	fallbackStub := &mockErrorDAO{}
+	rFail, _ := NewRoutingDAO(PersistenceModeDualWrite, primaryFail, fallbackStub, nil)
+	if _, err := rFail.SearchProfiles(ctx, models.SearchQuery{}); err == nil {
+		t.Error("expected error when primary fails during SearchProfiles")
+	}
+
+	// 3. Fallback fails on search: primary succeeds, fallback error is handled gracefully
+	nosqlDAO, err := NewNoSQLDAO("")
+	if err != nil {
+		t.Fatalf("failed to create nosql: %v", err)
+	}
+	defer func() { _ = nosqlDAO.Close() }()
+
+	hash, _ := security.HashPassword("pass")
+	if _, err := nosqlDAO.CreateUser(ctx, &models.UserProfile{ID: "p1", Name: "Alpha", Phone: "111"}, &models.UserCredential{Username: "u1", PasswordHash: hash}); err != nil {
+		t.Fatalf("failed creating p1: %v", err)
+	}
+	if _, err := nosqlDAO.CreateUser(ctx, &models.UserProfile{ID: "p2", Name: "Beta", Phone: "222"}, &models.UserCredential{Username: "u2", PasswordHash: hash}); err != nil {
+		t.Fatalf("failed creating p2: %v", err)
+	}
+
+	fallbackFail := &mockErrorDAO{searchErr: errors.New("fallback down")}
+	rFallbackFail, _ := NewRoutingDAO(PersistenceModeDualWriteNoSQLPrimary, fallbackFail, nosqlDAO, nil)
+
+	// Subcase A: offset >= len(primaryResults) -> empty slice
+	resA, err := rFallbackFail.SearchProfiles(ctx, models.SearchQuery{Offset: 5, Limit: 10})
+	if err != nil || len(resA) != 0 {
+		t.Errorf("expected empty slice when offset exceeds primary results during fallback failure, got %+v, err %v", resA, err)
+	}
+
+	// Subcase B: end > len(primaryResults) -> returns all available primary results
+	resB, err := rFallbackFail.SearchProfiles(ctx, models.SearchQuery{Offset: 0, Limit: 10})
+	if err != nil || len(resB) != 2 {
+		t.Errorf("expected 2 primary results when limit exceeds count during fallback failure, got %+v, err %v", resB, err)
+	}
+
+	// 4. offset >= len(merged) when both datastores succeed
+	rBoth, _ := NewRoutingDAO(PersistenceModeDualWriteNoSQLPrimary, fallbackStub, nosqlDAO, nil)
+	resBeyond, err := rBoth.SearchProfiles(ctx, models.SearchQuery{Offset: 10, Limit: 5})
+	if err != nil || len(resBeyond) != 0 {
+		t.Errorf("expected empty slice when offset exceeds total merged count, got %+v, err %v", resBeyond, err)
+	}
+
+	// 5. Standalone fallback accessor behavior
+	sqlDAO, err := NewSQLiteDAO("file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("failed to create sqlite: %v", err)
+	}
+	defer func() { _ = sqlDAO.Close() }()
+
+	rSQLSolo, _ := NewRoutingDAO(PersistenceModeSQLOnly, sqlDAO, nil, nil)
+	if fb := rSQLSolo.fallback(); fb != nil {
+		t.Errorf("expected nil fallback for SQL-only without NoSQL, got %+v", fb)
+	}
+
+	rNoSQLSolo, _ := NewRoutingDAO(PersistenceModeNoSQLOnly, nil, nosqlDAO, nil)
+	if fb := rNoSQLSolo.fallback(); fb != nil {
+		t.Errorf("expected nil fallback for NoSQL-only without SQL, got %+v", fb)
+	}
+}
+
 
 
 

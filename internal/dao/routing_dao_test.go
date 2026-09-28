@@ -3,6 +3,7 @@ package dao
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync/atomic"
 	"testing"
@@ -868,6 +869,58 @@ func TestRoutingDAO_SearchProfiles_MergeAndDeduplicate(t *testing.T) {
 		t.Errorf("expected paginated result %q to match offset 1 from full results %q", paged[0].ID, results[1].ID)
 	}
 }
+
+func TestRoutingDAO_SearchProfiles_ExceedsSinglePageCap(t *testing.T) {
+	ctx := context.Background()
+	sqlDAO, err := NewSQLiteDAO("file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("failed to create sqlite: %v", err)
+	}
+	defer func() { _ = sqlDAO.Close() }()
+	if err := sqlDAO.Migrate(ctx); err != nil {
+		t.Fatalf("failed to migrate sqlite: %v", err)
+	}
+
+	nosqlDAO, err := NewNoSQLDAO("")
+	if err != nil {
+		t.Fatalf("failed to create nosql: %v", err)
+	}
+	defer func() { _ = nosqlDAO.Close() }()
+
+	hash, _ := security.HashPassword("pass")
+
+	// Insert 105 users into SQL and 15 into NoSQL (total 120)
+	for i := 1; i <= 105; i++ {
+		p := &models.UserProfile{ID: fmt.Sprintf("sql-%03d", i), Name: "PageTest User", Phone: fmt.Sprintf("+1-555-%04d", i)}
+		c := &models.UserCredential{Username: fmt.Sprintf("sql_user_%03d", i), PasswordHash: hash}
+		if _, err := sqlDAO.CreateUser(ctx, p, c); err != nil {
+			t.Fatalf("failed creating sql user %d: %v", i, err)
+		}
+	}
+	for i := 106; i <= 120; i++ {
+		p := &models.UserProfile{ID: fmt.Sprintf("nosql-%03d", i), Name: "PageTest User", Phone: fmt.Sprintf("+1-555-%04d", i)}
+		c := &models.UserCredential{Username: fmt.Sprintf("nosql_user_%03d", i), PasswordHash: hash}
+		if _, err := nosqlDAO.CreateUser(ctx, p, c); err != nil {
+			t.Fatalf("failed creating nosql user %d: %v", i, err)
+		}
+	}
+
+	r, err := NewRoutingDAO(PersistenceModeDualWriteNoSQLPrimary, sqlDAO, nosqlDAO, nil)
+	if err != nil {
+		t.Fatalf("failed to create router: %v", err)
+	}
+
+	// Request offset=100, limit=20 (targeting items 100..119 out of 120 total)
+	pageResults, err := r.SearchProfiles(ctx, models.SearchQuery{Name: "PageTest", Offset: 100, Limit: 20})
+	if err != nil {
+		t.Fatalf("SearchProfiles beyond page cap failed: %v", err)
+	}
+
+	if len(pageResults) != 20 {
+		t.Fatalf("expected 20 items for offset 100 and limit 20 beyond 100-page cap, got %d", len(pageResults))
+	}
+}
+
 
 
 

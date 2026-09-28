@@ -821,4 +821,54 @@ func TestNoSQLDAO_CandidateMergeIntegrity(t *testing.T) {
 	}
 }
 
+func TestNoSQLDAO_DocumentKeyIdentityMismatch(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// 1. Map key "user1" but document ID "user2"
+	mismatchIDJSON := `{
+		"version": 1,
+		"documents": {
+			"user1": {"id": "user2", "profile": {"id": "user2", "name": "Mismatched", "phone": "123"}, "credential": {"username": "user1", "user_id": "user2"}}
+		}
+	}`
+	mismatchFile := filepath.Join(tmpDir, "mismatch_id.json")
+	if err := os.WriteFile(mismatchFile, []byte(mismatchIDJSON), 0600); err != nil {
+		t.Fatalf("failed to write test file: %v", err)
+	}
+	if _, err := NewNoSQLDAO(mismatchFile); err == nil {
+		t.Error("expected error loading document with mismatched document ID vs map key, got nil")
+	}
+
+	// 2. Profile ID mismatch
+	mismatchProfileJSON := `{
+		"version": 1,
+		"documents": {
+			"user1": {"id": "user1", "profile": {"id": "user2", "name": "Mismatched", "phone": "123"}, "credential": {"username": "user1", "user_id": "user1"}}
+		}
+	}`
+	mismatchProfileFile := filepath.Join(tmpDir, "mismatch_profile.json")
+	if err := os.WriteFile(mismatchProfileFile, []byte(mismatchProfileJSON), 0600); err != nil {
+		t.Fatalf("failed to write test file: %v", err)
+	}
+	if _, err := NewNoSQLDAO(mismatchProfileFile); err == nil {
+		t.Error("expected error loading document with mismatched profile ID vs map key, got nil")
+	}
+
+	// 3. Credential UserID mismatch
+	mismatchUserIDJSON := `{
+		"version": 1,
+		"documents": {
+			"user1": {"id": "user1", "profile": {"id": "user1", "name": "Mismatched", "phone": "123"}, "credential": {"username": "user1", "user_id": "user2"}}
+		}
+	}`
+	mismatchUserIDFile := filepath.Join(tmpDir, "mismatch_user_id.json")
+	if err := os.WriteFile(mismatchUserIDFile, []byte(mismatchUserIDJSON), 0600); err != nil {
+		t.Fatalf("failed to write test file: %v", err)
+	}
+	if _, err := NewNoSQLDAO(mismatchUserIDFile); err == nil {
+		t.Error("expected error loading document with mismatched credential user_id vs map key, got nil")
+	}
+}
+
+
 

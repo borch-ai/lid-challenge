@@ -279,6 +279,47 @@ func (r *RoutingDAO) GetProfile(ctx context.Context, userID string) (*models.Use
 	return prof, err
 }
 
+// fetchUpTo retrieves up to targetCount matching profiles from dao using bounded pages of up to 100.
+func fetchUpTo(ctx context.Context, d UserDAO, baseQuery models.SearchQuery, targetCount int) ([]*models.UserProfile, error) {
+	if targetCount <= 0 {
+		return nil, nil
+	}
+
+	const maxBackendPage = 100
+	var all []*models.UserProfile
+	currentOffset := 0
+
+	for len(all) < targetCount {
+		needed := targetCount - len(all)
+		pageSize := needed
+		if pageSize > maxBackendPage {
+			pageSize = maxBackendPage
+		}
+
+		pageQuery := baseQuery
+		pageQuery.Offset = currentOffset
+		pageQuery.Limit = pageSize
+
+		page, err := d.SearchProfiles(ctx, pageQuery)
+		if err != nil {
+			return all, err
+		}
+		if len(page) == 0 {
+			break
+		}
+
+		all = append(all, page...)
+		currentOffset += len(page)
+
+		// If fewer records returned than requested, backend has exhausted matching records
+		if len(page) < pageSize {
+			break
+		}
+	}
+
+	return all, nil
+}
+
 // SearchProfiles finds user profiles matching search criteria using the active primary datastore,
 // merging and deduplicating results from the alternate datastore when both datastores are configured.
 func (r *RoutingDAO) SearchProfiles(ctx context.Context, query models.SearchQuery) ([]*models.UserProfile, error) {
@@ -310,17 +351,14 @@ func (r *RoutingDAO) SearchProfiles(ctx context.Context, query models.SearchQuer
 		offset = 10000
 	}
 
-	// Fetch up to offset+limit from both datastores so we can merge, sort, and paginate accurately.
-	combinedQuery := query
-	combinedQuery.Offset = 0
-	combinedQuery.Limit = offset + limit
+	targetCount := offset + limit
 
-	primaryResults, err := primary.SearchProfiles(ctx, combinedQuery)
+	primaryResults, err := fetchUpTo(ctx, primary, query, targetCount)
 	if err != nil {
 		return nil, err
 	}
 
-	fallbackResults, fallbackErr := fallback.SearchProfiles(ctx, combinedQuery)
+	fallbackResults, fallbackErr := fetchUpTo(ctx, fallback, query, targetCount)
 	if fallbackErr != nil {
 		logger.Warn("alternate datastore search query failed during search merge",
 			slog.String("operation", "SearchProfiles"),

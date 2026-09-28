@@ -75,6 +75,21 @@ func validateDocuments(filePath string, docs map[string]*userDocument) error {
 		if doc == nil {
 			return fmt.Errorf("document store file %q contains null document for user ID %q", filePath, id)
 		}
+		if doc.ID == "" {
+			doc.ID = id
+		} else if doc.ID != id {
+			return fmt.Errorf("document store file %q contains mismatched document ID %q for map key %q", filePath, doc.ID, id)
+		}
+		if doc.Profile.ID == "" {
+			doc.Profile.ID = id
+		} else if doc.Profile.ID != id {
+			return fmt.Errorf("document store file %q contains mismatched profile ID %q for map key %q", filePath, doc.Profile.ID, id)
+		}
+		if doc.Credential.UserID == "" {
+			doc.Credential.UserID = id
+		} else if doc.Credential.UserID != id {
+			return fmt.Errorf("document store file %q contains mismatched credential user ID %q for map key %q", filePath, doc.Credential.UserID, id)
+		}
 		if doc.Credential.Username != "" {
 			if existingID, exists := seenUsernames[doc.Credential.Username]; exists && existingID != id {
 				return fmt.Errorf("document store file %q contains duplicate username %q for user IDs %q and %q", filePath, doc.Credential.Username, existingID, id)

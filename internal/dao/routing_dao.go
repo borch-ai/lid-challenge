@@ -573,8 +573,75 @@ func (r *RoutingDAO) MigrateUp(ctx context.Context) (int, error) {
 	return totalCount, nil
 }
 
-// MigrateDown rolls back migrations on all configured datastores.
+// MigrateDown rolls back migrations on configured datastores.
+// When both SQL and NoSQL datastores are configured in a routed deployment,
+// their migration histories are coordinated: SQL has migration 2 (secondary indexes)
+// and migration 1 (base user tables), whereas NoSQL has a single migration 1
+// (document collection initialization). Rolling down by 1 step from SQL v2
+// rolls back SQL indexes to v1 while preserving NoSQL collection and data at v1.
+// Rolling down to v0 rolls down both SQL base tables and the NoSQL collection.
 func (r *RoutingDAO) MigrateDown(ctx context.Context, steps int) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if steps <= 0 {
+		return 0, nil
+	}
+
+	r.mu.RLock()
+	sqlDAO := r.sqlDAO
+	nosqlDAO := r.nosqlDAO
+	r.mu.RUnlock()
+
+	sqlMig, hasSQL := sqlDAO.(MigratableDAO)
+	nosqlMig, hasNoSQL := nosqlDAO.(MigratableDAO)
+
+	// If both SQL and NoSQL are distinct migratable datastores, coordinate rollback
+	// to prevent tearing down NoSQL document collections prematurely when SQL is only
+	// rolling back secondary index migrations (v2 -> v1).
+	if hasSQL && hasNoSQL && sqlDAO != nosqlDAO {
+		sqlVer, err := sqlMig.MigrationVersion(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("failed to get sql migration version: %w", err)
+		}
+		nosqlVer, err := nosqlMig.MigrationVersion(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("failed to get nosql migration version: %w", err)
+		}
+
+		targetSQLVer := sqlVer - int64(steps)
+		if targetSQLVer < 0 {
+			targetSQLVer = 0
+		}
+		sqlSteps := int(sqlVer - targetSQLVer)
+
+		// Coordinated NoSQL rollback:
+		// If SQL still retains base tables (targetSQLVer >= 1), the NoSQL collection must remain at v1.
+		// Only if SQL rolls down past base tables (targetSQLVer == 0) does NoSQL roll down to v0.
+		var nosqlSteps int
+		if targetSQLVer == 0 && nosqlVer > 0 {
+			nosqlSteps = int(nosqlVer)
+		}
+
+		var totalCount int
+		if sqlSteps > 0 {
+			count, err := sqlMig.MigrateDown(ctx, sqlSteps)
+			if err != nil {
+				return totalCount, err
+			}
+			totalCount += count
+		}
+		if nosqlSteps > 0 {
+			count, err := nosqlMig.MigrateDown(ctx, nosqlSteps)
+			if err != nil {
+				return totalCount, err
+			}
+			totalCount += count
+		}
+		return totalCount, nil
+	}
+
+	// Fallback for single datastore configurations or standalone migratables.
 	var totalCount int
 	for _, m := range r.migratables() {
 		count, err := m.MigrateDown(ctx, steps)

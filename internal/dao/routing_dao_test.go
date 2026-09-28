@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -152,6 +153,7 @@ type mockErrorDAO struct {
 	verifyErr  error
 	upCount    int
 	downCount  int
+	versionErr error
 }
 
 func (m *mockErrorDAO) CreateUser(ctx context.Context, profile *models.UserProfile, cred *models.UserCredential) (string, error) {
@@ -210,6 +212,9 @@ func (m *mockErrorDAO) MigrateDown(ctx context.Context, steps int) (int, error) 
 }
 
 func (m *mockErrorDAO) MigrationVersion(ctx context.Context) (int64, error) {
+	if m.versionErr != nil {
+		return 0, m.versionErr
+	}
 	return 1, nil
 }
 
@@ -650,6 +655,168 @@ func TestRoutingDAO_Migratable_StandaloneWithSecondary(t *testing.T) {
 	}
 	if downCount != 3 {
 		t.Fatalf("expected downCount=3 (1+2), got %d", downCount)
+	}
+}
+
+func TestRoutingDAO_MigrateDown_CoordinatedRollback(t *testing.T) {
+	ctx := context.Background()
+
+	sqliteDAO, err := NewSQLiteDAO("file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("failed to create sqlite dao: %v", err)
+	}
+	defer func() { _ = sqliteDAO.Close() }()
+
+	nosqlDAO, err := NewNoSQLDAO("")
+	if err != nil {
+		t.Fatalf("failed to create nosql dao: %v", err)
+	}
+	defer func() { _ = nosqlDAO.Close() }()
+
+	r, err := NewRoutingDAO(PersistenceModeDualWrite, sqliteDAO, nosqlDAO, nil)
+	if err != nil {
+		t.Fatalf("failed to create routing dao: %v", err)
+	}
+
+	// 1. Migrate both backends: SQLite -> v2, NoSQL -> v1
+	if err := r.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate failed: %v", err)
+	}
+
+	sqlVer, _ := sqliteDAO.MigrationVersion(ctx)
+	nosqlVer, _ := nosqlDAO.MigrationVersion(ctx)
+	if sqlVer != 2 || nosqlVer != 1 {
+		t.Fatalf("expected sqlVer=2, nosqlVer=1, got sqlVer=%d, nosqlVer=%d", sqlVer, nosqlVer)
+	}
+
+	// 2. Create user in dual-write mode
+	prof := &models.UserProfile{
+		Name:  "Rollback Tester",
+		Phone: "+1-555-0100",
+		Address: models.Address{
+			StreetAddress: "123 Rollback St",
+			Locality:      "Denver",
+			Region:        "CO",
+			PostalCode:    "80202",
+			Country:       "USA",
+		},
+	}
+	cred := &models.UserCredential{
+		Username:     "rollbackuser",
+		PasswordHash: "hashedpass",
+	}
+	userID, err := r.CreateUser(ctx, prof, cred)
+	if err != nil {
+		t.Fatalf("failed to create user: %v", err)
+	}
+
+	// Verify user is in both stores
+	if _, err := sqliteDAO.GetProfile(ctx, userID); err != nil {
+		t.Fatalf("expected user in sqlite: %v", err)
+	}
+	if _, err := nosqlDAO.GetProfile(ctx, userID); err != nil {
+		t.Fatalf("expected user in nosql: %v", err)
+	}
+
+	// 3. Roll down 1 step: only SQLite rolls down v2 -> v1 (dropping index).
+	// NoSQL must NOT be rolled down (its sole migration is base collection v1 -> v0).
+	downCount, err := r.MigrateDown(ctx, 1)
+	if err != nil {
+		t.Fatalf("MigrateDown(1) failed: %v", err)
+	}
+	if downCount != 1 {
+		t.Fatalf("expected downCount=1 (only sql dropped secondary index), got %d", downCount)
+	}
+
+	sqlVer, _ = sqliteDAO.MigrationVersion(ctx)
+	nosqlVer, _ = nosqlDAO.MigrationVersion(ctx)
+	if sqlVer != 1 {
+		t.Fatalf("expected sqlVer=1, got %d", sqlVer)
+	}
+	if nosqlVer != 1 {
+		t.Fatalf("expected nosqlVer=1 (retained collection), got %d", nosqlVer)
+	}
+
+	// User must still exist in both datastores!
+	if p, err := r.GetProfile(ctx, userID); err != nil || p == nil {
+		t.Fatalf("expected user still accessible via routing dao after sql index rollback: %v", err)
+	}
+	if p, err := nosqlDAO.GetProfile(ctx, userID); err != nil || p == nil {
+		t.Fatalf("expected user still in nosql after sql index rollback: %v", err)
+	}
+
+	// 4. Roll down 1 more step: SQL drops base tables (v1 -> v0), NoSQL drops collection (v1 -> v0).
+	downCount, err = r.MigrateDown(ctx, 1)
+	if err != nil {
+		t.Fatalf("MigrateDown(1) second step failed: %v", err)
+	}
+	if downCount != 2 {
+		t.Fatalf("expected downCount=2 (1 sql + 1 nosql), got %d", downCount)
+	}
+
+	sqlVer, _ = sqliteDAO.MigrationVersion(ctx)
+	nosqlVer, _ = nosqlDAO.MigrationVersion(ctx)
+	if sqlVer != 0 || nosqlVer != 0 {
+		t.Fatalf("expected sqlVer=0 and nosqlVer=0, got sqlVer=%d, nosqlVer=%d", sqlVer, nosqlVer)
+	}
+
+	// 5. Roll down when already at v0 should return 0, nil
+	downCount, err = r.MigrateDown(ctx, 1)
+	if err != nil || downCount != 0 {
+		t.Fatalf("expected downCount=0 when already at 0, got %d, err: %v", downCount, err)
+	}
+
+	// 6. Test multi-step rollback from full migration
+	if err := r.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate failed on re-migrate: %v", err)
+	}
+	downCount, err = r.MigrateDown(ctx, 2)
+	if err != nil {
+		t.Fatalf("MigrateDown(2) failed: %v", err)
+	}
+	if downCount != 3 {
+		t.Fatalf("expected downCount=3 (2 sql + 1 nosql), got %d", downCount)
+	}
+}
+
+func TestRoutingDAO_MigrateDown_EdgeCasesAndErrors(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. steps <= 0
+	r, err := NewRoutingDAO(PersistenceModeDualWrite, &mockErrorDAO{}, &mockErrorDAO{}, nil)
+	if err != nil {
+		t.Fatalf("failed to create routing dao: %v", err)
+	}
+	count, err := r.MigrateDown(ctx, 0)
+	if err != nil || count != 0 {
+		t.Fatalf("expected count=0, nil err for steps=0, got %d, %v", count, err)
+	}
+	count, err = r.MigrateDown(ctx, -1)
+	if err != nil || count != 0 {
+		t.Fatalf("expected count=0, nil err for steps=-1, got %d, %v", count, err)
+	}
+
+	// 2. Canceled context
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := r.MigrateDown(canceledCtx, 1); err == nil {
+		t.Error("expected error with canceled context on MigrateDown")
+	}
+
+	// 3. SQL MigrationVersion error
+	sqlErrDAO := &mockErrorDAO{versionErr: errors.New("sql version query failed")}
+	nosqlOKDAO := &mockErrorDAO{}
+	rSQLErr, _ := NewRoutingDAO(PersistenceModeDualWrite, sqlErrDAO, nosqlOKDAO, nil)
+	if _, err := rSQLErr.MigrateDown(ctx, 1); err == nil || !strings.Contains(err.Error(), "failed to get sql migration version") {
+		t.Errorf("expected sql migration version error, got: %v", err)
+	}
+
+	// 4. NoSQL MigrationVersion error
+	nosqlErrDAO := &mockErrorDAO{versionErr: errors.New("nosql version query failed")}
+	sqlOKDAO := &mockErrorDAO{}
+	rNoSQLErr, _ := NewRoutingDAO(PersistenceModeDualWrite, sqlOKDAO, nosqlErrDAO, nil)
+	if _, err := rNoSQLErr.MigrateDown(ctx, 1); err == nil || !strings.Contains(err.Error(), "failed to get nosql migration version") {
+		t.Errorf("expected nosql migration version error, got: %v", err)
 	}
 }
 

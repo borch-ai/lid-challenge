@@ -49,9 +49,15 @@ func validatePersistenceModeDrivers(mode dao.PersistenceMode, primaryDriver, sec
 		if isNoSQLDriver(primaryDriver) {
 			return fmt.Errorf("persistence mode %q requires a SQL primary driver, but primary driver is %q", mode, primaryDriver)
 		}
+		if secondaryDriver != "" && !isNoSQLDriver(secondaryDriver) {
+			return fmt.Errorf("persistence mode %q requires any secondary driver to be a NoSQL driver (got %q); configuring a secondary SQL driver in SQL-only mode is unsupported", mode, secondaryDriver)
+		}
 	case dao.PersistenceModeNoSQLOnly:
 		if !isNoSQLDriver(primaryDriver) {
 			return fmt.Errorf("persistence mode %q requires a NoSQL primary driver, but primary driver is %q", mode, primaryDriver)
+		}
+		if secondaryDriver != "" && isNoSQLDriver(secondaryDriver) {
+			return fmt.Errorf("persistence mode %q requires any secondary driver to be a SQL driver (got %q); configuring a secondary NoSQL driver in NoSQL-only mode is unsupported", mode, secondaryDriver)
 		}
 	case dao.PersistenceModeDualWrite:
 		if secondaryDriver == "" {
@@ -103,13 +109,13 @@ func buildRoutingDAO(mode dao.PersistenceMode, driver1 string, dao1 dao.UserDAO,
 	switch mode {
 	case dao.PersistenceModeSQLOnly:
 		var nosqlDAO dao.UserDAO
-		if driver2 != "" && isNoSQLDriver(driver2) {
+		if driver2 != "" {
 			nosqlDAO = dao2
 		}
 		return dao.NewRoutingDAO(mode, dao1, nosqlDAO, logger)
 	case dao.PersistenceModeNoSQLOnly:
 		var sqlDAO dao.UserDAO
-		if driver2 != "" && !isNoSQLDriver(driver2) {
+		if driver2 != "" {
 			sqlDAO = dao2
 		}
 		return dao.NewRoutingDAO(mode, sqlDAO, dao1, logger)

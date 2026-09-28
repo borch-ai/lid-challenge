@@ -168,23 +168,33 @@ func TestBuildRoutingDAO(t *testing.T) {
 		t.Errorf("expected error when both drivers are NoSQL, got nil")
 	}
 
-	// Standalone mode: nosql_only with secondary nosql driver (primary must be dao1)
+	// Standalone mode: nosql_only rejects same-kind NoSQL secondary driver
 	memDAO, _ := dao.NewNoSQLDAO("memory")
-	rNoSQLStandalone, err := buildRoutingDAO(dao.PersistenceModeNoSQLOnly, "nosql", nosqlDAO, "memory", memDAO, nil)
-	if err != nil {
-		t.Fatalf("failed buildRoutingDAO for nosql_only with secondary: %v", err)
-	}
-	if rNoSQLStandalone.NoSQLDAO() != nosqlDAO {
-		t.Errorf("expected primary nosqlDAO to be retained in nosql_only mode, got secondary")
+	if _, err := buildRoutingDAO(dao.PersistenceModeNoSQLOnly, "nosql", nosqlDAO, "memory", memDAO, nil); err == nil {
+		t.Error("expected error when nosql_only is configured with secondary NoSQL driver, got nil")
 	}
 
-	// Standalone mode: sql_only with secondary nosql driver
+	// Standalone mode: sql_only rejects same-kind SQL secondary driver
+	if _, err := buildRoutingDAO(dao.PersistenceModeSQLOnly, "sqlite", sqliteDAO, "postgres", sqliteDAO, nil); err == nil {
+		t.Error("expected error when sql_only is configured with secondary SQL driver, got nil")
+	}
+
+	// Standalone mode: nosql_only with valid SQL secondary driver
+	rNoSQLStandalone, err := buildRoutingDAO(dao.PersistenceModeNoSQLOnly, "nosql", nosqlDAO, "sqlite", sqliteDAO, nil)
+	if err != nil {
+		t.Fatalf("failed buildRoutingDAO for nosql_only with sqlite secondary: %v", err)
+	}
+	if rNoSQLStandalone.NoSQLDAO() != nosqlDAO || rNoSQLStandalone.SQLDAO() != sqliteDAO {
+		t.Errorf("expected nosqlDAO and sqlDAO properly mapped in nosql_only mode with secondary")
+	}
+
+	// Standalone mode: sql_only with valid NoSQL secondary driver
 	rSQLStandalone, err := buildRoutingDAO(dao.PersistenceModeSQLOnly, "sqlite", sqliteDAO, "nosql", nosqlDAO, nil)
 	if err != nil {
 		t.Fatalf("failed buildRoutingDAO for sql_only with secondary: %v", err)
 	}
-	if rSQLStandalone.SQLDAO() != sqliteDAO {
-		t.Errorf("expected primary sqlDAO to be retained in sql_only mode")
+	if rSQLStandalone.SQLDAO() != sqliteDAO || rSQLStandalone.NoSQLDAO() != nosqlDAO {
+		t.Errorf("expected sqlDAO and nosqlDAO properly mapped in sql_only mode with secondary")
 	}
 }
 
@@ -207,6 +217,13 @@ func TestValidatePersistenceConfig(t *testing.T) {
 	}
 	if err := validatePersistenceConfig("dual_write_nosql_primary", "nosql", "users.json", "postgres", "postgres://localhost/test"); err != nil {
 		t.Errorf("expected valid dual_write_nosql_primary config, got: %v", err)
+	}
+
+	if err := validatePersistenceConfig("sql_only", "sqlite", "lid.db", "nosql", "users.json"); err != nil {
+		t.Errorf("expected valid sql_only config with nosql secondary, got: %v", err)
+	}
+	if err := validatePersistenceConfig("nosql_only", "nosql", "users.json", "sqlite", "lid.db"); err != nil {
+		t.Errorf("expected valid nosql_only config with sqlite secondary, got: %v", err)
 	}
 
 	// Invalid configs
@@ -257,6 +274,14 @@ func TestValidatePersistenceConfig(t *testing.T) {
 	// 12. primary non-memory driver without DSN
 	if err := validatePersistenceConfig("nosql_only", "nosql", "", "", ""); err == nil {
 		t.Error("expected error for nosql_only with nosql driver without DSN, got nil")
+	}
+	// 13. sql_only with same-kind secondary SQL driver
+	if err := validatePersistenceConfig("sql_only", "sqlite", "lid.db", "postgres", "postgres://localhost/test"); err == nil {
+		t.Error("expected error for sql_only with secondary SQL driver, got nil")
+	}
+	// 14. nosql_only with same-kind secondary NoSQL driver
+	if err := validatePersistenceConfig("nosql_only", "nosql", "users.json", "memory", ""); err == nil {
+		t.Error("expected error for nosql_only with secondary NoSQL driver, got nil")
 	}
 }
 

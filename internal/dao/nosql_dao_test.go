@@ -967,5 +967,159 @@ func TestNoSQLDAO_PersistLocked_DiskMergeIDCollisionRejection(t *testing.T) {
 	}
 }
 
+func TestNoSQLDAO_UnsupportedSchemaVersion(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// 1. Future version (version 2) on initial load
+	v2JSON := `{
+		"version": 2,
+		"documents": {}
+	}`
+	v2File := filepath.Join(tmpDir, "v2.json")
+	if err := os.WriteFile(v2File, []byte(v2JSON), 0600); err != nil {
+		t.Fatalf("failed to write v2 file: %v", err)
+	}
+	if _, err := NewNoSQLDAO(v2File); err == nil {
+		t.Error("expected error loading document store with version 2, got nil")
+	}
+
+	// 2. Negative version on initial load
+	negJSON := `{
+		"version": -1,
+		"documents": {}
+	}`
+	negFile := filepath.Join(tmpDir, "neg.json")
+	if err := os.WriteFile(negFile, []byte(negJSON), 0600); err != nil {
+		t.Fatalf("failed to write neg file: %v", err)
+	}
+	if _, err := NewNoSQLDAO(negFile); err == nil {
+		t.Error("expected error loading document store with negative version, got nil")
+	}
+
+	// 3. Future version introduced on disk during reload merge
+	v1File := filepath.Join(tmpDir, "v1_to_v2.json")
+	if err := os.WriteFile(v1File, []byte(`{"version": 1, "documents": {}}`), 0600); err != nil {
+		t.Fatalf("failed to write v1 file: %v", err)
+	}
+	store, err := NewNoSQLDAO(v1File)
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	// External process updates disk to version 2
+	if err := os.WriteFile(v1File, []byte(`{"version": 2, "documents": {}}`), 0600); err != nil {
+		t.Fatalf("failed to update to v2: %v", err)
+	}
+	ctx := context.Background()
+	hash, _ := security.HashPassword("pass")
+	_, err = store.CreateUser(ctx, &models.UserProfile{Name: "Test", Phone: "123"}, &models.UserCredential{Username: "test", PasswordHash: hash})
+	if err == nil {
+		t.Error("expected CreateUser to fail when disk file has unsupported schema version 2, got nil")
+	}
+}
+
+func TestNoSQLDAO_CreateUser_PopulatesCallerObjects(t *testing.T) {
+	ctx := context.Background()
+	store, err := NewNoSQLDAO("")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	hash, _ := security.HashPassword("pass")
+	p := &models.UserProfile{
+		Name:  "Alice",
+		Phone: "123",
+	}
+	c := &models.UserCredential{
+		Username:     "alice",
+		PasswordHash: hash,
+	}
+
+	id, err := store.CreateUser(ctx, p, c)
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	if p.ID != id || p.ID == "" {
+		t.Errorf("expected p.ID to be populated with %q, got %q", id, p.ID)
+	}
+	if p.CreatedAt.IsZero() {
+		t.Errorf("expected p.CreatedAt to be non-zero")
+	}
+	if p.UpdatedAt.IsZero() {
+		t.Errorf("expected p.UpdatedAt to be non-zero")
+	}
+	if c.UserID != id {
+		t.Errorf("expected c.UserID to be populated with %q, got %q", id, c.UserID)
+	}
+	if c.CreatedAt.IsZero() {
+		t.Errorf("expected c.CreatedAt to be non-zero")
+	}
+	if c.UpdatedAt.IsZero() {
+		t.Errorf("expected c.UpdatedAt to be non-zero")
+	}
+}
+
+func TestNoSQLDAO_MigrateDown_TearsDownCollectionAndData(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "teardown_test.json")
+
+	store, err := NewNoSQLDAO(filePath)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	// Apply migration 1
+	if _, err := store.MigrateUp(ctx); err != nil {
+		t.Fatalf("failed to migrate up: %v", err)
+	}
+
+	hash, _ := security.HashPassword("pass")
+	p := &models.UserProfile{Name: "Bob", Phone: "456"}
+	c := &models.UserCredential{Username: "bob", PasswordHash: hash}
+	id, err := store.CreateUser(ctx, p, c)
+	if err != nil {
+		t.Fatalf("failed to create user: %v", err)
+	}
+
+	// Verify profile is accessible before rollback
+	if _, err := store.GetProfile(ctx, id); err != nil {
+		t.Fatalf("expected profile to exist before rollback, got: %v", err)
+	}
+
+	// Roll back migration 1 -> tears down collection
+	downCount, err := store.MigrateDown(ctx, 1)
+	if err != nil || downCount != 1 {
+		t.Fatalf("expected MigrateDown to return 1, got %d, err %v", downCount, err)
+	}
+
+	// Verify profile is no longer in store
+	if _, err := store.GetProfile(ctx, id); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("expected ErrUserNotFound after MigrateDown rollback, got %v", err)
+	}
+	if _, err := store.GetCredential(ctx, "bob"); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("expected ErrUserNotFound for credential after MigrateDown rollback, got %v", err)
+	}
+
+	// Reopen file in separate DAO instance: must be version 0 and empty
+	reopened, err := NewNoSQLDAO(filePath)
+	if err != nil {
+		t.Fatalf("failed to reopen store: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+
+	ver, err := reopened.MigrationVersion(ctx)
+	if err != nil || ver != 0 {
+		t.Fatalf("expected version 0 on reopened store, got %d, err %v", ver, err)
+	}
+	if _, err := reopened.GetProfile(ctx, id); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("expected ErrUserNotFound on reopened store after rollback, got %v", err)
+	}
+}
+
 
 

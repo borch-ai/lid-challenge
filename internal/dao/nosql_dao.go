@@ -177,8 +177,11 @@ func NewNoSQLDAO(dsn string) (*NoSQLDAO, error) {
 			if err != nil {
 				return nil, err
 			}
+			if ver < 0 || ver > 1 {
+				return nil, fmt.Errorf("unsupported document store schema version %d (only versions 0 and 1 are supported)", ver)
+			}
 			dao.docs = loaded
-			if ver >= 1 {
+			if ver == 1 {
 				dao.migrated = true
 				dao.appliedAt = appliedAt
 			}
@@ -199,12 +202,20 @@ func NewNoSQLDAO(dsn string) (*NoSQLDAO, error) {
 }
 
 func (d *NoSQLDAO) mergeFromDiskLocked(cleanPath string, targetDocs map[string]*userDocument, targetByUsername map[string]string, isRollback bool, newlyCreatedID string) error {
+	if isRollback {
+		// Rolling back tears down the schema and drops all documents/indexes,
+		// matching the behavior of SQL migrations dropping user_profile and user_credential tables.
+		return nil
+	}
 	// #nosec G304 -- administrative datastore file path configured via DSN
 	diskData, err := os.ReadFile(cleanPath)
 	if err == nil && len(diskData) > 0 {
 		diskDocs, diskVer, diskAppliedAt, err := parseDocumentStoreFile(cleanPath, diskData)
 		if err != nil {
 			return fmt.Errorf("failed to reload document store file %q: %w", cleanPath, err)
+		}
+		if diskVer < 0 || diskVer > 1 {
+			return fmt.Errorf("unsupported document store schema version %d (only versions 0 and 1 are supported)", diskVer)
 		}
 		if newlyCreatedID != "" {
 			if _, exists := diskDocs[newlyCreatedID]; exists {
@@ -226,7 +237,7 @@ func (d *NoSQLDAO) mergeFromDiskLocked(cleanPath string, targetDocs map[string]*
 				targetDocs[id] = diskDoc
 			}
 		}
-		if !isRollback && diskVer > 0 && !d.migrated {
+		if diskVer == 1 && !d.migrated {
 			d.migrated = true
 			d.appliedAt = diskAppliedAt
 		}
@@ -387,6 +398,9 @@ func (d *NoSQLDAO) CreateUser(ctx context.Context, profile *models.UserProfile, 
 		delete(d.byUsername, cred.Username)
 		return "", err
 	}
+
+	*profile = profCopy
+	*cred = credCopy
 
 	return id, nil
 }
@@ -619,9 +633,15 @@ func (d *NoSQLDAO) MigrateDown(ctx context.Context, steps int) (int, error) {
 	d.migrated = false
 	prevAppliedAt := d.appliedAt
 	d.appliedAt = nil
+	prevDocs := d.docs
+	prevByUsername := d.byUsername
+	d.docs = make(map[string]*userDocument)
+	d.byUsername = make(map[string]string)
 	if err := d.persistLocked(true); err != nil {
 		d.migrated = true
 		d.appliedAt = prevAppliedAt
+		d.docs = prevDocs
+		d.byUsername = prevByUsername
 		return 0, err
 	}
 	return 1, nil

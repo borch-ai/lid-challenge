@@ -178,55 +178,66 @@ func TestBuildRoutingDAO(t *testing.T) {
 
 func TestValidatePersistenceConfig(t *testing.T) {
 	// Valid configs
-	if err := validatePersistenceConfig("sql_only", "sqlite", ""); err != nil {
+	if err := validatePersistenceConfig("sql_only", "sqlite", "", ""); err != nil {
 		t.Errorf("expected valid sql_only config, got: %v", err)
 	}
-	if err := validatePersistenceConfig("nosql_only", "nosql", ""); err != nil {
+	if err := validatePersistenceConfig("nosql_only", "nosql", "", ""); err != nil {
 		t.Errorf("expected valid nosql_only config, got: %v", err)
 	}
-	if err := validatePersistenceConfig("dual_write", "sqlite", "nosql"); err != nil {
-		t.Errorf("expected valid dual_write config, got: %v", err)
+	if err := validatePersistenceConfig("dual_write", "sqlite", "nosql", "data/users.json"); err != nil {
+		t.Errorf("expected valid dual_write config with nosql file, got: %v", err)
 	}
-	if err := validatePersistenceConfig("dual_write_nosql_primary", "nosql", "postgres"); err != nil {
+	if err := validatePersistenceConfig("dual_write", "sqlite", "memory", ""); err != nil {
+		t.Errorf("expected valid dual_write config with memory secondary, got: %v", err)
+	}
+	if err := validatePersistenceConfig("dual_write_nosql_primary", "nosql", "postgres", "postgres://localhost/test"); err != nil {
 		t.Errorf("expected valid dual_write_nosql_primary config, got: %v", err)
 	}
 
 	// Invalid configs
 	// 1. sql_only with NoSQL driver
-	if err := validatePersistenceConfig("sql_only", "nosql", ""); err == nil {
+	if err := validatePersistenceConfig("sql_only", "nosql", "", ""); err == nil {
 		t.Error("expected error for sql_only with nosql driver, got nil")
 	}
 	// 2. nosql_only with SQL driver
-	if err := validatePersistenceConfig("nosql_only", "sqlite", ""); err == nil {
+	if err := validatePersistenceConfig("nosql_only", "sqlite", "", ""); err == nil {
 		t.Error("expected error for nosql_only with sqlite driver, got nil")
 	}
 	// 3. dual_write without secondary driver
-	if err := validatePersistenceConfig("dual_write", "sqlite", ""); err == nil {
+	if err := validatePersistenceConfig("dual_write", "sqlite", "", ""); err == nil {
 		t.Error("expected error for dual_write without secondary driver, got nil")
 	}
 	// 4. dual_write with both SQL drivers
-	if err := validatePersistenceConfig("dual_write", "sqlite", "postgres"); err == nil {
+	if err := validatePersistenceConfig("dual_write", "sqlite", "postgres", "postgres://localhost/test"); err == nil {
 		t.Error("expected error for dual_write with two SQL drivers, got nil")
 	}
 	// 5. dual_write with both NoSQL drivers
-	if err := validatePersistenceConfig("dual_write", "nosql", "memory"); err == nil {
+	if err := validatePersistenceConfig("dual_write", "nosql", "memory", ""); err == nil {
 		t.Error("expected error for dual_write with two NoSQL drivers, got nil")
 	}
 	// 6. Unknown persistence mode
-	if err := validatePersistenceConfig("unknown_mode", "sqlite", ""); err == nil {
+	if err := validatePersistenceConfig("unknown_mode", "sqlite", "", ""); err == nil {
 		t.Error("expected error for unknown persistence mode, got nil")
 	}
 	// 7. dual_write with inverted drivers (NoSQL primary)
-	if err := validatePersistenceConfig("dual_write", "nosql", "sqlite"); err == nil {
+	if err := validatePersistenceConfig("dual_write", "nosql", "sqlite", "sqlite.db"); err == nil {
 		t.Error("expected error for dual_write with NoSQL primary driver, got nil")
 	}
 	// 8. dual_write_nosql_primary with inverted drivers (SQL primary)
-	if err := validatePersistenceConfig("dual_write_nosql_primary", "sqlite", "nosql"); err == nil {
+	if err := validatePersistenceConfig("dual_write_nosql_primary", "sqlite", "nosql", "data/users.json"); err == nil {
 		t.Error("expected error for dual_write_nosql_primary with SQL primary driver, got nil")
 	}
 	// 9. dual_write_nosql_primary without secondary driver
-	if err := validatePersistenceConfig("dual_write_nosql_primary", "nosql", ""); err == nil {
+	if err := validatePersistenceConfig("dual_write_nosql_primary", "nosql", "", ""); err == nil {
 		t.Error("expected error for dual_write_nosql_primary without secondary driver, got nil")
+	}
+	// 10. dual_write with non-memory secondary driver without DSN
+	if err := validatePersistenceConfig("dual_write", "sqlite", "nosql", ""); err == nil {
+		t.Error("expected error for dual_write with nosql secondary driver without DSN, got nil")
+	}
+	// 11. dual_write_nosql_primary with non-memory secondary driver without DSN
+	if err := validatePersistenceConfig("dual_write_nosql_primary", "nosql", "postgres", ""); err == nil {
+		t.Error("expected error for dual_write_nosql_primary with postgres secondary driver without DSN, got nil")
 	}
 }
 

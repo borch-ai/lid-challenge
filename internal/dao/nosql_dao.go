@@ -198,7 +198,45 @@ func NewNoSQLDAO(dsn string) (*NoSQLDAO, error) {
 	return dao, nil
 }
 
-func (d *NoSQLDAO) persistLocked(isRollback bool) error {
+func (d *NoSQLDAO) mergeFromDiskLocked(cleanPath string, targetDocs map[string]*userDocument, targetByUsername map[string]string, isRollback bool, newlyCreatedID string) error {
+	// #nosec G304 -- administrative datastore file path configured via DSN
+	diskData, err := os.ReadFile(cleanPath)
+	if err == nil && len(diskData) > 0 {
+		diskDocs, diskVer, diskAppliedAt, err := parseDocumentStoreFile(cleanPath, diskData)
+		if err != nil {
+			return fmt.Errorf("failed to reload document store file %q: %w", cleanPath, err)
+		}
+		if newlyCreatedID != "" {
+			if _, exists := diskDocs[newlyCreatedID]; exists {
+				return fmt.Errorf("user with ID %q already exists on disk: %w", newlyCreatedID, ErrInvalidInput)
+			}
+		}
+		for id, diskDoc := range diskDocs {
+			existing, exists := targetDocs[id]
+			if !exists || diskDoc.UpdatedAt.After(existing.UpdatedAt) {
+				if exists && existing.Credential.Username != "" && existing.Credential.Username != diskDoc.Credential.Username {
+					delete(targetByUsername, existing.Credential.Username)
+				}
+				if diskDoc.Credential.Username != "" {
+					if existingID, ok := targetByUsername[diskDoc.Credential.Username]; ok && existingID != id {
+						return fmt.Errorf("reload document store file %q detected duplicate username %q for user IDs %q and %q", cleanPath, diskDoc.Credential.Username, existingID, id)
+					}
+					targetByUsername[diskDoc.Credential.Username] = id
+				}
+				targetDocs[id] = diskDoc
+			}
+		}
+		if !isRollback && diskVer > 0 && !d.migrated {
+			d.migrated = true
+			d.appliedAt = diskAppliedAt
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to read document store file %q: %w", cleanPath, err)
+	}
+	return nil
+}
+
+func (d *NoSQLDAO) persistLocked(isRollback bool, newlyCreatedIDs ...string) error {
 	if d.filePath == "" {
 		return nil
 	}
@@ -215,35 +253,15 @@ func (d *NoSQLDAO) persistLocked(isRollback bool) error {
 		candidateByUsername[k] = v
 	}
 
+	var newID string
+	if len(newlyCreatedIDs) > 0 {
+		newID = newlyCreatedIDs[0]
+	}
+
 	// Reload and merge any existing documents on disk to prevent lost writes
 	// across processes or separate instances accessing the same file.
-	diskData, err := os.ReadFile(cleanPath)
-	if err == nil && len(diskData) > 0 {
-		diskDocs, diskVer, diskAppliedAt, err := parseDocumentStoreFile(cleanPath, diskData)
-		if err != nil {
-			return fmt.Errorf("failed to reload document store file %q: %w", cleanPath, err)
-		}
-		for id, diskDoc := range diskDocs {
-			existing, exists := candidateDocs[id]
-			if !exists || diskDoc.UpdatedAt.After(existing.UpdatedAt) {
-				if exists && existing.Credential.Username != "" && existing.Credential.Username != diskDoc.Credential.Username {
-					delete(candidateByUsername, existing.Credential.Username)
-				}
-				if diskDoc.Credential.Username != "" {
-					if existingID, ok := candidateByUsername[diskDoc.Credential.Username]; ok && existingID != id {
-						return fmt.Errorf("reload document store file %q detected duplicate username %q for user IDs %q and %q", cleanPath, diskDoc.Credential.Username, existingID, id)
-					}
-					candidateByUsername[diskDoc.Credential.Username] = id
-				}
-				candidateDocs[id] = diskDoc
-			}
-		}
-		if !isRollback && diskVer > 0 && !d.migrated {
-			d.migrated = true
-			d.appliedAt = diskAppliedAt
-		}
-	} else if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to read document store file %q: %w", cleanPath, err)
+	if err := d.mergeFromDiskLocked(cleanPath, candidateDocs, candidateByUsername, isRollback, newID); err != nil {
+		return err
 	}
 
 	var version int64
@@ -305,6 +323,14 @@ func (d *NoSQLDAO) CreateUser(ctx context.Context, profile *models.UserProfile, 
 		return "", errors.New("nosql dao is closed")
 	}
 
+	// For file-backed DAO, reload disk state to incorporate documents and usernames persisted by other instances.
+	if d.filePath != "" {
+		cleanPath := filepath.Clean(d.filePath)
+		if err := d.mergeFromDiskLocked(cleanPath, d.docs, d.byUsername, false, ""); err != nil {
+			return "", err
+		}
+	}
+
 	if strings.TrimSpace(cred.Username) == "" || strings.TrimSpace(cred.PasswordHash) == "" {
 		return "", fmt.Errorf("%w: username and password_hash are required", ErrInvalidInput)
 	}
@@ -356,7 +382,7 @@ func (d *NoSQLDAO) CreateUser(ctx context.Context, profile *models.UserProfile, 
 	d.docs[id] = doc
 	d.byUsername[cred.Username] = id
 
-	if err := d.persistLocked(false); err != nil {
+	if err := d.persistLocked(false, id); err != nil {
 		delete(d.docs, id)
 		delete(d.byUsername, cred.Username)
 		return "", err

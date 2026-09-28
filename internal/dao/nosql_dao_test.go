@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -867,6 +868,102 @@ func TestNoSQLDAO_DocumentKeyIdentityMismatch(t *testing.T) {
 	}
 	if _, err := NewNoSQLDAO(mismatchUserIDFile); err == nil {
 		t.Error("expected error loading document with mismatched credential user_id vs map key, got nil")
+	}
+}
+
+func TestNoSQLDAO_CreateUser_DiskIDCollisionRejection(t *testing.T) {
+	ctx := context.Background()
+	hash, err := security.HashPassword("secretpass")
+	if err != nil {
+		t.Fatalf("failed to hash password: %v", err)
+	}
+
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "shared_store.json")
+
+	store1, err := NewNoSQLDAO(filePath)
+	if err != nil {
+		t.Fatalf("failed to create store1: %v", err)
+	}
+	defer func() { _ = store1.Close() }()
+
+	store2, err := NewNoSQLDAO(filePath)
+	if err != nil {
+		t.Fatalf("failed to create store2: %v", err)
+	}
+	defer func() { _ = store2.Close() }()
+
+	// Store 1 creates a user with caller-supplied ID
+	origProfile := &models.UserProfile{ID: "shared-user-1", Name: "Original User", Phone: "555-1111"}
+	origCred := &models.UserCredential{Username: "orig_user", PasswordHash: hash}
+	if _, err := store1.CreateUser(ctx, origProfile, origCred); err != nil {
+		t.Fatalf("store1 failed to create user: %v", err)
+	}
+
+	// Store 2 attempts to create a user with the same caller-supplied ID
+	collidingProfile := &models.UserProfile{ID: "shared-user-1", Name: "Colliding User", Phone: "555-2222"}
+	collidingCred := &models.UserCredential{Username: "colliding_user", PasswordHash: hash}
+	if _, err := store2.CreateUser(ctx, collidingProfile, collidingCred); err == nil {
+		t.Fatal("expected store2.CreateUser to fail with duplicate ID conflict from disk, got nil")
+	}
+
+	// Verify store 2 did not overwrite the document on disk or corrupt username indices
+	profOnDisk, err := store1.GetProfile(ctx, "shared-user-1")
+	if err != nil {
+		t.Fatalf("store1 failed to get profile: %v", err)
+	}
+	if profOnDisk.Name != "Original User" {
+		t.Errorf("expected original profile name %q, got %q (document was overwritten!)", "Original User", profOnDisk.Name)
+	}
+
+	// Verify colliding username was not indexed
+	if _, err := store2.GetCredential(ctx, "colliding_user"); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("expected ErrUserNotFound for colliding username that failed creation, got %v", err)
+	}
+}
+
+func TestNoSQLDAO_PersistLocked_DiskMergeIDCollisionRejection(t *testing.T) {
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "merge_collision.json")
+
+	initialJSON := `{
+		"version": 1,
+		"documents": {
+			"existing-1": {"id": "existing-1", "profile": {"name": "Ex", "phone": "123"}, "credential": {"username": "ex", "password_hash": "h"}, "updated_at": "2020-01-01T00:00:00Z"}
+		}
+	}`
+	if err := os.WriteFile(filePath, []byte(initialJSON), 0600); err != nil {
+		t.Fatalf("failed to write initial file: %v", err)
+	}
+
+	store, err := NewNoSQLDAO(filePath)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	// External process writes "new-doc-1" to disk
+	externalJSON := `{
+		"version": 1,
+		"documents": {
+			"existing-1": {"id": "existing-1", "profile": {"name": "Ex", "phone": "123"}, "credential": {"username": "ex", "password_hash": "h"}, "updated_at": "2020-01-01T00:00:00Z"},
+			"new-doc-1": {"id": "new-doc-1", "profile": {"name": "External Doc", "phone": "456"}, "credential": {"username": "ext_doc", "password_hash": "h"}, "updated_at": "2020-01-01T00:00:00Z"}
+		}
+	}`
+	if err := os.WriteFile(filePath, []byte(externalJSON), 0600); err != nil {
+		t.Fatalf("failed to write external file: %v", err)
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	// persistLocked with newlyCreatedID="new-doc-1" must reject collision
+	err = store.persistLocked(false, "new-doc-1")
+	if err == nil {
+		t.Fatal("expected persistLocked to reject collision for newly created ID existing on disk, got nil")
+	}
+	if !strings.Contains(err.Error(), "already exists on disk") {
+		t.Errorf("expected error containing 'already exists on disk', got: %v", err)
 	}
 }
 

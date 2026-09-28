@@ -41,11 +41,7 @@ func initUserDAO(driver, dsn string) (dao.UserDAO, error) {
 	}
 }
 
-func validatePersistenceConfig(modeStr, primaryDriver, secondaryDriver string) error {
-	mode, err := dao.ParsePersistenceMode(modeStr)
-	if err != nil {
-		return err
-	}
+func validatePersistenceModeDrivers(mode dao.PersistenceMode, primaryDriver, secondaryDriver string) error {
 	switch mode {
 	case dao.PersistenceModeSQLOnly:
 		if isNoSQLDriver(primaryDriver) {
@@ -79,8 +75,23 @@ func validatePersistenceConfig(modeStr, primaryDriver, secondaryDriver string) e
 	return nil
 }
 
+func validatePersistenceConfig(modeStr, primaryDriver, secondaryDriver, secondaryDSN string) error {
+	mode, err := dao.ParsePersistenceMode(modeStr)
+	if err != nil {
+		return err
+	}
+	if err := validatePersistenceModeDrivers(mode, primaryDriver, secondaryDriver); err != nil {
+		return err
+	}
+	trimmedSecDriver := strings.ToLower(strings.TrimSpace(secondaryDriver))
+	if trimmedSecDriver != "" && trimmedSecDriver != "memory" && strings.TrimSpace(secondaryDSN) == "" {
+		return fmt.Errorf("secondary database DSN must be configured for secondary driver %q (use %q driver for explicit in-memory storage)", secondaryDriver, "memory")
+	}
+	return nil
+}
+
 func buildRoutingDAO(mode dao.PersistenceMode, driver1 string, dao1 dao.UserDAO, driver2 string, dao2 dao.UserDAO, logger *slog.Logger) (*dao.RoutingDAO, error) {
-	if err := validatePersistenceConfig(string(mode), driver1, driver2); err != nil {
+	if err := validatePersistenceModeDrivers(mode, driver1, driver2); err != nil {
 		return nil, err
 	}
 	switch mode {
@@ -124,7 +135,7 @@ func main() {
 			Level: logLevel,
 		}))
 
-		if err := validatePersistenceConfig(dbCfg.PersistenceMode, dbCfg.Driver, dbCfg.SecondaryDriver); err != nil {
+		if err := validatePersistenceConfig(dbCfg.PersistenceMode, dbCfg.Driver, dbCfg.SecondaryDriver, dbCfg.SecondaryDSN); err != nil {
 			logger.Error("invalid persistence configuration", slog.Any("error", err))
 			os.Exit(1)
 		}
@@ -185,7 +196,7 @@ func main() {
 		slog.Int("port", cfg.Server.Port),
 	)
 
-	if err := validatePersistenceConfig(cfg.PersistenceMode, cfg.DBDriver, cfg.SecondaryDBDriver); err != nil {
+	if err := validatePersistenceConfig(cfg.PersistenceMode, cfg.DBDriver, cfg.SecondaryDBDriver, cfg.SecondaryDBDSN); err != nil {
 		logger.Error("invalid persistence configuration", slog.Any("error", err))
 		os.Exit(1)
 	}

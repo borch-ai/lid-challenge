@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 
@@ -109,6 +110,21 @@ func (r *RoutingDAO) targets() (primary, secondary UserDAO) {
 	default:
 		return r.sqlDAO, nil
 	}
+}
+
+// fallback returns the alternate configured datastore if distinct from the primary.
+func (r *RoutingDAO) fallback() UserDAO {
+	primary, _ := r.targets()
+	if primary == r.sqlDAO {
+		if r.nosqlDAO != nil && r.nosqlDAO != primary {
+			return r.nosqlDAO
+		}
+		return nil
+	}
+	if r.sqlDAO != nil && r.sqlDAO != primary {
+		return r.sqlDAO
+	}
+	return nil
 }
 
 // Mode returns the currently active persistence mode.
@@ -246,74 +262,159 @@ func (r *RoutingDAO) CreateUser(ctx context.Context, profile *models.UserProfile
 }
 
 // GetProfile retrieves a user profile by unique user ID from the active primary datastore,
-// falling back to SQL datastore if missing from NoSQL prior to historical data backfill.
+// falling back to the alternate datastore if missing from the primary prior to historical data backfill.
 func (r *RoutingDAO) GetProfile(ctx context.Context, userID string) (*models.UserProfile, error) {
 	r.mu.RLock()
 	primary, _ := r.targets()
-	sqlFallback := r.sqlDAO
+	fallback := r.fallback()
 	r.mu.RUnlock()
 
 	if primary == nil {
 		return nil, errors.New("no active primary datastore configured")
 	}
 	prof, err := primary.GetProfile(ctx, userID)
-	if errors.Is(err, ErrUserNotFound) && sqlFallback != nil && primary != sqlFallback {
-		return sqlFallback.GetProfile(ctx, userID)
+	if errors.Is(err, ErrUserNotFound) && fallback != nil {
+		return fallback.GetProfile(ctx, userID)
 	}
 	return prof, err
 }
 
 // SearchProfiles finds user profiles matching search criteria using the active primary datastore,
-// falling back to SQL datastore if no matches are found in NoSQL prior to historical data backfill.
+// merging and deduplicating results from the alternate datastore when both datastores are configured.
 func (r *RoutingDAO) SearchProfiles(ctx context.Context, query models.SearchQuery) ([]*models.UserProfile, error) {
 	r.mu.RLock()
 	primary, _ := r.targets()
-	sqlFallback := r.sqlDAO
+	fallback := r.fallback()
+	logger := r.logger
 	r.mu.RUnlock()
 
 	if primary == nil {
 		return nil, errors.New("no active primary datastore configured")
 	}
-	results, err := primary.SearchProfiles(ctx, query)
-	if err == nil && len(results) == 0 && sqlFallback != nil && primary != sqlFallback {
-		return sqlFallback.SearchProfiles(ctx, query)
+
+	if fallback == nil {
+		return primary.SearchProfiles(ctx, query)
 	}
-	return results, err
+
+	limit := query.Limit
+	if limit <= 0 {
+		limit = 20
+	} else if limit > 100 {
+		limit = 100
+	}
+
+	offset := query.Offset
+	if offset < 0 {
+		offset = 0
+	} else if offset > 10000 {
+		offset = 10000
+	}
+
+	// Fetch up to offset+limit from both datastores so we can merge, sort, and paginate accurately.
+	combinedQuery := query
+	combinedQuery.Offset = 0
+	combinedQuery.Limit = offset + limit
+
+	primaryResults, err := primary.SearchProfiles(ctx, combinedQuery)
+	if err != nil {
+		return nil, err
+	}
+
+	fallbackResults, fallbackErr := fallback.SearchProfiles(ctx, combinedQuery)
+	if fallbackErr != nil {
+		logger.Warn("alternate datastore search query failed during search merge",
+			slog.String("operation", "SearchProfiles"),
+			slog.Any("error", fallbackErr),
+		)
+		if offset >= len(primaryResults) {
+			return []*models.UserProfile{}, nil
+		}
+		end := offset + limit
+		if end > len(primaryResults) {
+			end = len(primaryResults)
+		}
+		return primaryResults[offset:end], nil
+	}
+
+	seen := make(map[string]struct{}, len(primaryResults)+len(fallbackResults))
+	merged := make([]*models.UserProfile, 0, len(primaryResults)+len(fallbackResults))
+
+	for _, p := range primaryResults {
+		if p == nil {
+			continue
+		}
+		if _, ok := seen[p.ID]; !ok {
+			seen[p.ID] = struct{}{}
+			merged = append(merged, p)
+		}
+	}
+
+	for _, p := range fallbackResults {
+		if p == nil {
+			continue
+		}
+		if _, ok := seen[p.ID]; !ok {
+			seen[p.ID] = struct{}{}
+			merged = append(merged, p)
+		}
+	}
+
+	sort.Slice(merged, func(i, j int) bool {
+		if merged[i].CreatedAt.Equal(merged[j].CreatedAt) {
+			return merged[i].ID > merged[j].ID
+		}
+		return merged[i].CreatedAt.After(merged[j].CreatedAt)
+	})
+
+	if offset >= len(merged) {
+		return []*models.UserProfile{}, nil
+	}
+
+	end := offset + limit
+	if end > len(merged) {
+		end = len(merged)
+	}
+
+	return merged[offset:end], nil
 }
 
 // GetCredential retrieves user credential details by username from the active primary datastore,
-// falling back to SQL datastore if missing from NoSQL prior to historical data backfill.
+// falling back to the alternate datastore if missing from the primary prior to historical data backfill.
 func (r *RoutingDAO) GetCredential(ctx context.Context, username string) (*models.UserCredential, error) {
 	r.mu.RLock()
 	primary, _ := r.targets()
-	sqlFallback := r.sqlDAO
+	fallback := r.fallback()
 	r.mu.RUnlock()
 
 	if primary == nil {
 		return nil, errors.New("no active primary datastore configured")
 	}
 	cred, err := primary.GetCredential(ctx, username)
-	if errors.Is(err, ErrUserNotFound) && sqlFallback != nil && primary != sqlFallback {
-		return sqlFallback.GetCredential(ctx, username)
+	if errors.Is(err, ErrUserNotFound) && fallback != nil {
+		return fallback.GetCredential(ctx, username)
 	}
 	return cred, err
 }
 
 // VerifyUserCredential validates credentials against the active primary datastore,
-// falling back to SQL datastore if missing from NoSQL prior to historical data backfill.
+// falling back to the alternate datastore if missing from the primary prior to historical data backfill.
 func (r *RoutingDAO) VerifyUserCredential(ctx context.Context, username, password string) (*models.UserProfile, error) {
 	r.mu.RLock()
 	primary, _ := r.targets()
-	sqlFallback := r.sqlDAO
+	fallback := r.fallback()
 	r.mu.RUnlock()
 
 	if primary == nil {
 		return nil, errors.New("no active primary datastore configured")
 	}
 	prof, err := primary.VerifyUserCredential(ctx, username, password)
-	if errors.Is(err, ErrUserNotFound) && sqlFallback != nil && primary != sqlFallback {
-		if fallbackProf, fallbackErr := sqlFallback.VerifyUserCredential(ctx, username, password); fallbackErr == nil {
+	if errors.Is(err, ErrUserNotFound) && fallback != nil {
+		fallbackProf, fallbackErr := fallback.VerifyUserCredential(ctx, username, password)
+		if fallbackErr == nil {
 			return fallbackProf, nil
+		}
+		if !errors.Is(fallbackErr, ErrUserNotFound) {
+			return nil, fallbackErr
 		}
 	}
 	return prof, err

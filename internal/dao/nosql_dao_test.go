@@ -700,3 +700,125 @@ func TestNoSQLDAO_PingHealthCheck(t *testing.T) {
 	}
 }
 
+func TestNoSQLDAO_FileBackedMigrateDownRollback(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "migrate_down_test.json")
+
+	store, err := NewNoSQLDAO(filePath)
+	if err != nil {
+		t.Fatalf("failed to create nosql dao: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	// Initially version 0
+	ver, err := store.MigrationVersion(ctx)
+	if err != nil || ver != 0 {
+		t.Fatalf("expected initial version 0, got %d, err %v", ver, err)
+	}
+
+	// MigrateUp -> version 1
+	upCount, err := store.MigrateUp(ctx)
+	if err != nil || upCount != 1 {
+		t.Fatalf("expected MigrateUp to return 1, got %d, err %v", upCount, err)
+	}
+	ver, err = store.MigrationVersion(ctx)
+	if err != nil || ver != 1 {
+		t.Fatalf("expected version 1 after MigrateUp, got %d, err %v", ver, err)
+	}
+	status, err := store.MigrationStatus(ctx)
+	if err != nil || len(status) == 0 || !status[0].Applied {
+		t.Fatalf("expected status applied true, got %+v, err %v", status, err)
+	}
+
+	// MigrateDown -> version 0
+	downCount, err := store.MigrateDown(ctx, 1)
+	if err != nil || downCount != 1 {
+		t.Fatalf("expected MigrateDown to return 1, got %d, err %v", downCount, err)
+	}
+	ver, err = store.MigrationVersion(ctx)
+	if err != nil || ver != 0 {
+		t.Fatalf("expected version 0 after MigrateDown, got %d, err %v", ver, err)
+	}
+	status, err = store.MigrationStatus(ctx)
+	if err != nil || len(status) == 0 || status[0].Applied {
+		t.Fatalf("expected status applied false, got %+v, err %v", status, err)
+	}
+
+	// Reopen file in a new DAO instance to verify disk persistence of rollback
+	reopened, err := NewNoSQLDAO(filePath)
+	if err != nil {
+		t.Fatalf("failed to reopen store: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+
+	reopenedVer, err := reopened.MigrationVersion(ctx)
+	if err != nil || reopenedVer != 0 {
+		t.Fatalf("expected reopened store to have version 0, got %d, err %v", reopenedVer, err)
+	}
+	reopenedStatus, err := reopened.MigrationStatus(ctx)
+	if err != nil || len(reopenedStatus) == 0 || reopenedStatus[0].Applied {
+		t.Fatalf("expected reopened status applied false, got %+v, err %v", reopenedStatus, err)
+	}
+
+	// Can be migrated up again
+	upAgain, err := reopened.MigrateUp(ctx)
+	if err != nil || upAgain != 1 {
+		t.Fatalf("expected MigrateUp on reopened store to succeed with 1, got %d, err %v", upAgain, err)
+	}
+}
+
+func TestNoSQLDAO_CandidateMergeIntegrity(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "merge_integrity.json")
+
+	hash, _ := security.HashPassword("secret")
+
+	// Create initial file with user1 ("alice") and user2 ("bob")
+	initStore, err := NewNoSQLDAO(filePath)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	if _, err := initStore.CreateUser(ctx, &models.UserProfile{ID: "user1", Name: "Alice", Phone: "+1-555-0101"}, &models.UserCredential{Username: "alice", PasswordHash: hash}); err != nil {
+		t.Fatalf("failed to create user1: %v", err)
+	}
+	if _, err := initStore.CreateUser(ctx, &models.UserProfile{ID: "user2", Name: "Bob", Phone: "+1-555-0102"}, &models.UserCredential{Username: "bob", PasswordHash: hash}); err != nil {
+		t.Fatalf("failed to create user2: %v", err)
+	}
+	_ = initStore.Close()
+
+	// Open store in second instance
+	store, err := NewNoSQLDAO(filePath)
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	// External process replaces user1's username on disk with "bob" (which collides with user2)
+	externalConflictJSON := `{
+		"version": 1,
+		"documents": {
+			"user1": {"id": "user1", "profile": {"name": "Alice", "phone": "+1-555-0101"}, "credential": {"username": "bob", "password_hash": "h"}, "updated_at": "2099-01-01T00:00:00Z"},
+			"user2": {"id": "user2", "profile": {"name": "Bob", "phone": "+1-555-0102"}, "credential": {"username": "bob", "password_hash": "h"}, "updated_at": "2099-01-01T00:00:00Z"}
+		}
+	}`
+	if err := os.WriteFile(filePath, []byte(externalConflictJSON), 0600); err != nil {
+		t.Fatalf("failed to write external conflict: %v", err)
+	}
+
+	// Local write triggers persistLocked which reloads and detects the conflict during candidate validation
+	_, createErr := store.CreateUser(ctx, &models.UserProfile{ID: "user3", Name: "Charlie", Phone: "+1-555-0103"}, &models.UserCredential{Username: "charlie", PasswordHash: hash})
+	if createErr == nil {
+		t.Fatal("expected CreateUser to fail due to external username collision during reload merge")
+	}
+
+	// Verify in-memory username index was NOT corrupted by the failed merge:
+	// "alice" must still exist and map to user1, and user1's profile must still be accessible
+	cred, err := store.GetCredential(ctx, "alice")
+	if err != nil || cred.UserID != "user1" {
+		t.Fatalf("expected 'alice' mapping to be preserved in byUsername index, got cred %+v, err %v", cred, err)
+	}
+}
+
+

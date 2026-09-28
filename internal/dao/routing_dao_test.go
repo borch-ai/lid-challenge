@@ -724,4 +724,150 @@ func TestRoutingDAO_NormalizedReplication_NoSQLPrimary(t *testing.T) {
 	}
 }
 
+func TestRoutingDAO_ReadFallback_NoSQLToSQL(t *testing.T) {
+	ctx := context.Background()
+	sqlDAO, err := NewSQLiteDAO("file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("failed to create sqlite: %v", err)
+	}
+	defer func() { _ = sqlDAO.Close() }()
+	if err := sqlDAO.Migrate(ctx); err != nil {
+		t.Fatalf("failed to migrate sqlite: %v", err)
+	}
+
+	nosqlDAO, err := NewNoSQLDAO("")
+	if err != nil {
+		t.Fatalf("failed to create nosql: %v", err)
+	}
+	defer func() { _ = nosqlDAO.Close() }()
+
+	// Directly insert a user into NoSQL only (e.g., written during nosql_only mode)
+	hash, _ := security.HashPassword("nosqlpass")
+	pNoSQL := &models.UserProfile{Name: "NoSQL Only User", Phone: "+1-555-0999"}
+	cNoSQL := &models.UserCredential{Username: "nosql_user", PasswordHash: hash}
+	userID, err := nosqlDAO.CreateUser(ctx, pNoSQL, cNoSQL)
+	if err != nil {
+		t.Fatalf("failed to create nosql user: %v", err)
+	}
+
+	// Router is configured with SQL primary (e.g. switched to sql_only or dual_write)
+	r, err := NewRoutingDAO(PersistenceModeSQLOnly, sqlDAO, nosqlDAO, nil)
+	if err != nil {
+		t.Fatalf("failed to create routing dao: %v", err)
+	}
+
+	// 1. GetProfile falls back to NoSQL
+	prof, err := r.GetProfile(ctx, userID)
+	if err != nil || prof.Name != "NoSQL Only User" {
+		t.Errorf("expected NoSQL fallback for GetProfile, got prof %+v, err %v", prof, err)
+	}
+
+	// 2. GetCredential falls back to NoSQL
+	cred, err := r.GetCredential(ctx, "nosql_user")
+	if err != nil || cred.UserID != userID {
+		t.Errorf("expected NoSQL fallback for GetCredential, got cred %+v, err %v", cred, err)
+	}
+
+	// 3. VerifyUserCredential falls back to NoSQL
+	authProf, err := r.VerifyUserCredential(ctx, "nosql_user", "nosqlpass")
+	if err != nil || authProf.ID != userID {
+		t.Errorf("expected NoSQL fallback for VerifyUserCredential, got %+v, err %v", authProf, err)
+	}
+
+	// Wrong password returns ErrInvalidPassword, not ErrUserNotFound
+	if _, err := r.VerifyUserCredential(ctx, "nosql_user", "wrongpass"); !errors.Is(err, security.ErrInvalidPassword) {
+		t.Errorf("expected ErrInvalidPassword for wrong password via fallback, got %v", err)
+	}
+
+	// 4. SearchProfiles falls back to NoSQL
+	results, err := r.SearchProfiles(ctx, models.SearchQuery{Name: "NoSQL Only"})
+	if err != nil || len(results) != 1 || results[0].ID != userID {
+		t.Errorf("expected NoSQL fallback for SearchProfiles, got %+v, err %v", results, err)
+	}
+}
+
+func TestRoutingDAO_SearchProfiles_MergeAndDeduplicate(t *testing.T) {
+	ctx := context.Background()
+	sqlDAO, err := NewSQLiteDAO("file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("failed to create sqlite: %v", err)
+	}
+	defer func() { _ = sqlDAO.Close() }()
+	if err := sqlDAO.Migrate(ctx); err != nil {
+		t.Fatalf("failed to migrate sqlite: %v", err)
+	}
+
+	nosqlDAO, err := NewNoSQLDAO("")
+	if err != nil {
+		t.Fatalf("failed to create nosql: %v", err)
+	}
+	defer func() { _ = nosqlDAO.Close() }()
+
+	hash, _ := security.HashPassword("pass")
+
+	// User 1 only in SQL
+	p1 := &models.UserProfile{ID: "user-sql-1", Name: "Shared Alice", Phone: "+1-555-0201"}
+	c1 := &models.UserCredential{Username: "alice_sql", PasswordHash: hash}
+	if _, err := sqlDAO.CreateUser(ctx, p1, c1); err != nil {
+		t.Fatalf("failed creating sql user: %v", err)
+	}
+
+	// User 2 only in NoSQL
+	p2 := &models.UserProfile{ID: "user-nosql-2", Name: "Shared Bob", Phone: "+1-555-0202"}
+	c2 := &models.UserCredential{Username: "bob_nosql", PasswordHash: hash}
+	if _, err := nosqlDAO.CreateUser(ctx, p2, c2); err != nil {
+		t.Fatalf("failed creating nosql user: %v", err)
+	}
+
+	// User 3 in both SQL and NoSQL (already backfilled/replicated)
+	p3 := &models.UserProfile{ID: "user-both-3", Name: "Shared Charlie", Phone: "+1-555-0203"}
+	c3 := &models.UserCredential{Username: "charlie_both", PasswordHash: hash}
+	if _, err := sqlDAO.CreateUser(ctx, p3, c3); err != nil {
+		t.Fatalf("failed creating user 3 in sql: %v", err)
+	}
+	if _, err := nosqlDAO.CreateUser(ctx, p3, c3); err != nil {
+		t.Fatalf("failed creating user 3 in nosql: %v", err)
+	}
+
+	r, err := NewRoutingDAO(PersistenceModeDualWriteNoSQLPrimary, sqlDAO, nosqlDAO, nil)
+	if err != nil {
+		t.Fatalf("failed to create router: %v", err)
+	}
+
+	// Search matching "Shared" across both datastores
+	results, err := r.SearchProfiles(ctx, models.SearchQuery{Name: "Shared", Limit: 10})
+	if err != nil {
+		t.Fatalf("SearchProfiles failed: %v", err)
+	}
+
+	// Must return exactly 3 deduplicated results
+	if len(results) != 3 {
+		t.Fatalf("expected 3 merged and deduplicated results, got %d", len(results))
+	}
+
+	ids := make(map[string]bool)
+	for _, p := range results {
+		if ids[p.ID] {
+			t.Errorf("duplicate ID %q returned in search results", p.ID)
+		}
+		ids[p.ID] = true
+	}
+	if !ids["user-sql-1"] || !ids["user-nosql-2"] || !ids["user-both-3"] {
+		t.Errorf("missing expected user IDs in results: %v", ids)
+	}
+
+	// Test pagination on merged results: offset 1, limit 1
+	paged, err := r.SearchProfiles(ctx, models.SearchQuery{Name: "Shared", Limit: 1, Offset: 1})
+	if err != nil {
+		t.Fatalf("paginated SearchProfiles failed: %v", err)
+	}
+	if len(paged) != 1 {
+		t.Fatalf("expected 1 paginated result, got %d", len(paged))
+	}
+	if paged[0].ID != results[1].ID {
+		t.Errorf("expected paginated result %q to match offset 1 from full results %q", paged[0].ID, results[1].ID)
+	}
+}
+
+
 

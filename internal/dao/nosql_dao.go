@@ -183,12 +183,22 @@ func NewNoSQLDAO(dsn string) (*NoSQLDAO, error) {
 	return dao, nil
 }
 
-func (d *NoSQLDAO) persistLocked() error {
+func (d *NoSQLDAO) persistLocked(isRollback bool) error {
 	if d.filePath == "" {
 		return nil
 	}
 
 	cleanPath := filepath.Clean(d.filePath)
+
+	// Build candidate document map and candidate username index first to ensure atomic merge and validation.
+	candidateDocs := make(map[string]*userDocument, len(d.docs))
+	for k, v := range d.docs {
+		candidateDocs[k] = v
+	}
+	candidateByUsername := make(map[string]string, len(d.byUsername))
+	for k, v := range d.byUsername {
+		candidateByUsername[k] = v
+	}
 
 	// Reload and merge any existing documents on disk to prevent lost writes
 	// across processes or separate instances accessing the same file.
@@ -199,21 +209,21 @@ func (d *NoSQLDAO) persistLocked() error {
 			return fmt.Errorf("failed to reload document store file %q: %w", cleanPath, err)
 		}
 		for id, diskDoc := range diskDocs {
-			existing, exists := d.docs[id]
+			existing, exists := candidateDocs[id]
 			if !exists || diskDoc.UpdatedAt.After(existing.UpdatedAt) {
 				if exists && existing.Credential.Username != "" && existing.Credential.Username != diskDoc.Credential.Username {
-					delete(d.byUsername, existing.Credential.Username)
+					delete(candidateByUsername, existing.Credential.Username)
 				}
 				if diskDoc.Credential.Username != "" {
-					if existingID, ok := d.byUsername[diskDoc.Credential.Username]; ok && existingID != id {
+					if existingID, ok := candidateByUsername[diskDoc.Credential.Username]; ok && existingID != id {
 						return fmt.Errorf("reload document store file %q detected duplicate username %q for user IDs %q and %q", cleanPath, diskDoc.Credential.Username, existingID, id)
 					}
-					d.byUsername[diskDoc.Credential.Username] = id
+					candidateByUsername[diskDoc.Credential.Username] = id
 				}
-				d.docs[id] = diskDoc
+				candidateDocs[id] = diskDoc
 			}
 		}
-		if diskVer > 0 && !d.migrated {
+		if !isRollback && diskVer > 0 && !d.migrated {
 			d.migrated = true
 			d.appliedAt = diskAppliedAt
 		}
@@ -228,7 +238,7 @@ func (d *NoSQLDAO) persistLocked() error {
 	payload := nosqlFilePayload{
 		Version:   version,
 		AppliedAt: d.appliedAt,
-		Documents: d.docs,
+		Documents: candidateDocs,
 	}
 
 	data, err := json.MarshalIndent(payload, "", "  ")
@@ -253,6 +263,10 @@ func (d *NoSQLDAO) persistLocked() error {
 		_ = os.Remove(tmpFile)
 		return fmt.Errorf("failed to persist document store: %w", err)
 	}
+
+	// Commit candidate maps only after successful validation, merge, and disk serialization
+	d.docs = candidateDocs
+	d.byUsername = candidateByUsername
 
 	return nil
 }
@@ -327,7 +341,7 @@ func (d *NoSQLDAO) CreateUser(ctx context.Context, profile *models.UserProfile, 
 	d.docs[id] = doc
 	d.byUsername[cred.Username] = id
 
-	if err := d.persistLocked(); err != nil {
+	if err := d.persistLocked(false); err != nil {
 		delete(d.docs, id)
 		delete(d.byUsername, cred.Username)
 		return "", err
@@ -508,7 +522,7 @@ func (d *NoSQLDAO) Migrate(ctx context.Context) error {
 		d.migrated = true
 		now := time.Now().UTC()
 		d.appliedAt = &now
-		if err := d.persistLocked(); err != nil {
+		if err := d.persistLocked(false); err != nil {
 			d.migrated = false
 			d.appliedAt = nil
 			return err
@@ -537,7 +551,7 @@ func (d *NoSQLDAO) MigrateUp(ctx context.Context) (int, error) {
 	d.migrated = true
 	now := time.Now().UTC()
 	d.appliedAt = &now
-	if err := d.persistLocked(); err != nil {
+	if err := d.persistLocked(false); err != nil {
 		d.migrated = false
 		d.appliedAt = nil
 		return 0, err
@@ -564,7 +578,7 @@ func (d *NoSQLDAO) MigrateDown(ctx context.Context, steps int) (int, error) {
 	d.migrated = false
 	prevAppliedAt := d.appliedAt
 	d.appliedAt = nil
-	if err := d.persistLocked(); err != nil {
+	if err := d.persistLocked(true); err != nil {
 		d.migrated = true
 		d.appliedAt = prevAppliedAt
 		return 0, err

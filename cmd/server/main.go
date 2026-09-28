@@ -34,7 +34,9 @@ func initUserDAO(driver, dsn string) (dao.UserDAO, error) {
 		return dao.NewSQLiteDAO(dsn)
 	case "postgres", "postgresql", "cockroach", "cockroachdb":
 		return dao.NewPostgresDAO(dsn)
-	case "nosql", "document", "memory":
+	case "memory":
+		return dao.NewNoSQLDAO("memory://")
+	case "nosql", "document":
 		return dao.NewNoSQLDAO(dsn)
 	default:
 		return nil, fmt.Errorf("unsupported database driver: %s", driver)

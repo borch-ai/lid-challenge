@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -99,6 +100,17 @@ func TestInitUserDAO(t *testing.T) {
 			t.Fatalf("expected %s init to succeed, got %v", drv, err)
 		}
 		_ = d.Close()
+	}
+
+	// 2b. Memory driver forces in-memory store even if passed a file-backed DSN
+	nonExistentFile := filepath.Join(t.TempDir(), "should_not_exist.json")
+	memDAO, err := initUserDAO("memory", nonExistentFile)
+	if err != nil {
+		t.Fatalf("expected memory driver init to succeed: %v", err)
+	}
+	defer func() { _ = memDAO.Close() }()
+	if _, statErr := os.Stat(nonExistentFile); !os.IsNotExist(statErr) {
+		t.Errorf("expected file %s to not exist, but got err: %v", nonExistentFile, statErr)
 	}
 
 	// 3. Postgres driver routes to NewPostgresDAO

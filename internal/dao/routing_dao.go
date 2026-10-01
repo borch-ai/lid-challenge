@@ -228,19 +228,14 @@ func (r *RoutingDAO) CreateUser(ctx context.Context, profile *models.UserProfile
 	// verify that the requested username does not already exist in the alternate store.
 	// This prevents duplicate username collisions during migration/cutover windows
 	// and in standalone modes with an alternate datastore configured.
+	// Fails closed if the alternate datastore cannot be queried to preserve uniqueness guarantees.
 	if fallback != nil {
-		if existingCred, altErr := fallback.GetCredential(ctx, cred.Username); altErr == nil && existingCred != nil {
+		existingCred, altErr := fallback.GetCredential(ctx, cred.Username)
+		if altErr == nil && existingCred != nil {
 			return "", ErrUsernameTaken
-		} else if altErr != nil && !errors.Is(altErr, ErrUserNotFound) {
-			if ctx.Err() != nil {
-				return "", ctx.Err()
-			}
-			// Transient error checking alternate datastore: log warning, continue isolating transient failures
-			logger.Warn("alternate datastore preflight credential check encountered transient error",
-				slog.String("operation", "CreateUser"),
-				slog.String("username", cred.Username),
-				slog.Any("error", altErr),
-			)
+		}
+		if altErr != nil && !errors.Is(altErr, ErrUserNotFound) {
+			return "", fmt.Errorf("failed to verify username uniqueness against alternate datastore: %w", altErr)
 		}
 	}
 
@@ -699,14 +694,19 @@ func (r *RoutingDAO) MigrationVersion(ctx context.Context) (int64, error) {
 	return 1, nil
 }
 
-// MigrationStatus returns migration statuses from the active primary datastore.
+// MigrationStatus returns status information for all registered migrations across configured datastores.
 func (r *RoutingDAO) MigrationStatus(ctx context.Context) ([]MigrationStatus, error) {
-	r.mu.RLock()
-	primary, _ := r.targets()
-	r.mu.RUnlock()
-
-	if m, ok := primary.(MigratableDAO); ok {
-		return m.MigrationStatus(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	return nil, nil
+
+	var allStatuses []MigrationStatus
+	for _, m := range r.migratables() {
+		statuses, err := m.MigrationStatus(ctx)
+		if err != nil {
+			return nil, err
+		}
+		allStatuses = append(allStatuses, statuses...)
+	}
+	return allStatuses, nil
 }

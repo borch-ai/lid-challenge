@@ -1333,8 +1333,74 @@ func TestRoutingDAO_AlternateDatastore_UsernameConflictPreflight(t *testing.T) {
 	if !errors.Is(err, ErrUsernameTaken) {
 		t.Errorf("expected ErrUsernameTaken in dual_write preflight, got: %v", err)
 	}
-	if _, err := sqliteDAO3.GetCredential(ctx, "dup_user"); !errors.Is(err, ErrUserNotFound) {
-		t.Errorf("expected primary SQL store not to be written to during preflight rejection, got: %v", err)
+	// Case 4: Alternate store outage / error -> fail closed to preserve uniqueness guarantees
+	sqliteDAO4, _ := NewSQLiteDAO("file::memory:?cache=shared")
+	defer func() { _ = sqliteDAO4.Close() }()
+	_ = sqliteDAO4.Migrate(ctx)
+
+	failingAlternate := &mockErrorDAO{getCredErr: errors.New("nosql datastore connection timeout")}
+	rFailClosed, err := NewRoutingDAO(PersistenceModeSQLOnly, sqliteDAO4, failingAlternate, nil)
+	if err != nil {
+		t.Fatalf("failed to create routing dao: %v", err)
+	}
+
+	_, err = rFailClosed.CreateUser(ctx, &models.UserProfile{Name: "Fail Closed", Phone: "777"}, &models.UserCredential{Username: "any_user", PasswordHash: hash})
+	if err == nil || !strings.Contains(err.Error(), "failed to verify username uniqueness against alternate datastore") {
+		t.Fatalf("expected fail-closed error on alternate store outage, got: %v", err)
+	}
+	if _, err := sqliteDAO4.GetCredential(ctx, "any_user"); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("expected primary SQL store not to be written to when alternate check fails closed, got: %v", err)
+	}
+}
+
+func TestRoutingDAO_MigrationStatus_IncludesSecondaryState(t *testing.T) {
+	ctx := context.Background()
+	sqlDAO, _ := NewSQLiteDAO("file::memory:?cache=shared")
+	defer func() { _ = sqlDAO.Close() }()
+	_ = sqlDAO.Migrate(ctx)
+
+	nosqlDAO, _ := NewNoSQLDAO("memory://")
+	defer func() { _ = nosqlDAO.Close() }()
+	// Keep nosqlDAO unmigrated initially
+	r, err := NewRoutingDAO(PersistenceModeDualWrite, sqlDAO, nosqlDAO, nil)
+	if err != nil {
+		t.Fatalf("failed to create router: %v", err)
+	}
+
+	statuses, err := r.MigrationStatus(ctx)
+	if err != nil {
+		t.Fatalf("MigrationStatus failed: %v", err)
+	}
+
+	// Should contain SQL migrations (2) + NoSQL migration (1) = 3 total statuses
+	if len(statuses) != 3 {
+		t.Fatalf("expected 3 migration statuses across SQL and NoSQL, got %d: %+v", len(statuses), statuses)
+	}
+
+	// SQL migrations should be applied; NoSQL should show applied=false
+	var foundNoSQL bool
+	for _, s := range statuses {
+		if s.Name == "000001_nosql_document_store" {
+			foundNoSQL = true
+			if s.Applied {
+				t.Errorf("expected NoSQL migration to show applied=false before Migrate")
+			}
+		}
+	}
+	if !foundNoSQL {
+		t.Error("expected NoSQL migration status to be included in multi-store MigrationStatus")
+	}
+
+	// Now migrate NoSQL and verify status updates
+	_ = nosqlDAO.Migrate(ctx)
+	statusesUpdated, err := r.MigrationStatus(ctx)
+	if err != nil {
+		t.Fatalf("MigrationStatus after migrate failed: %v", err)
+	}
+	for _, s := range statusesUpdated {
+		if s.Name == "000001_nosql_document_store" && !s.Applied {
+			t.Errorf("expected NoSQL migration to show applied=true after Migrate")
+		}
 	}
 }
 

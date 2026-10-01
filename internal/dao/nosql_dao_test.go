@@ -130,6 +130,9 @@ func TestNoSQLDAO_CreateAndRetrieve(t *testing.T) {
 		t.Fatalf("failed to create store: %v", err)
 	}
 	defer func() { _ = store.Close() }()
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("failed to migrate store: %v", err)
+	}
 
 	hash, err := security.HashPassword("secure-password123")
 	if err != nil {
@@ -296,6 +299,9 @@ func TestNoSQLDAO_SearchProfiles_ExactMatchSemantics(t *testing.T) {
 		t.Fatalf("failed to create store: %v", err)
 	}
 	defer func() { _ = store.Close() }()
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("failed to migrate store: %v", err)
+	}
 
 	hash, _ := security.HashPassword("pwd")
 
@@ -389,6 +395,9 @@ func TestNoSQLDAO_FilePersistence(t *testing.T) {
 	store1, err := NewNoSQLDAO("file://" + storeFile)
 	if err != nil {
 		t.Fatalf("failed to create file-backed store: %v", err)
+	}
+	if err := store1.Migrate(ctx); err != nil {
+		t.Fatalf("failed to migrate store1: %v", err)
 	}
 
 	hash, _ := security.HashPassword("persistpass")
@@ -547,7 +556,10 @@ func TestNoSQLDAO_FilePersistence(t *testing.T) {
 	// Phase 10: Reject duplicate usernames during reload merge in persistLocked
 	diskReloadFile := filepath.Join(tmpDir, "reload_dup.json")
 	initialJSON := `{
-		"user1": {"id": "user1", "profile": {"name": "U1", "phone": "123"}, "credential": {"username": "unique1", "password_hash": "h1"}}
+		"version": 1,
+		"documents": {
+			"user1": {"id": "user1", "profile": {"name": "U1", "phone": "123"}, "credential": {"username": "unique1", "password_hash": "h1"}}
+		}
 	}`
 	if err := os.WriteFile(diskReloadFile, []byte(initialJSON), 0600); err != nil {
 		t.Fatalf("failed to write reload file: %v", err)
@@ -564,8 +576,11 @@ func TestNoSQLDAO_FilePersistence(t *testing.T) {
 	}
 	// Simulate external process writing a different user ID with the same username "conflict" to disk
 	externalJSON := `{
-		"user1": {"id": "user1", "profile": {"name": "U1", "phone": "123"}, "credential": {"username": "unique1", "password_hash": "h1"}},
-		"external1": {"id": "external1", "profile": {"name": "Ext", "phone": "222"}, "credential": {"username": "conflict", "password_hash": "h2"}}
+		"version": 1,
+		"documents": {
+			"user1": {"id": "user1", "profile": {"name": "U1", "phone": "123"}, "credential": {"username": "unique1", "password_hash": "h1"}},
+			"external1": {"id": "external1", "profile": {"name": "Ext", "phone": "222"}, "credential": {"username": "conflict", "password_hash": "h2"}}
+		}
 	}`
 	if err := os.WriteFile(diskReloadFile, []byte(externalJSON), 0600); err != nil {
 		t.Fatalf("failed to write external JSON: %v", err)
@@ -577,7 +592,10 @@ func TestNoSQLDAO_FilePersistence(t *testing.T) {
 
 	// Phase 11: Verify replaced document's old username is removed from index on reload
 	updateUserJSON := `{
-		"user1": {"id": "user1", "profile": {"name": "U1", "phone": "123"}, "credential": {"username": "new_alice", "password_hash": "h1"}, "updated_at": "2099-01-01T00:00:00Z"}
+		"version": 1,
+		"documents": {
+			"user1": {"id": "user1", "profile": {"name": "U1", "phone": "123"}, "credential": {"username": "new_alice", "password_hash": "h1"}, "updated_at": "2099-01-01T00:00:00Z"}
+		}
 	}`
 	if err := os.WriteFile(diskReloadFile, []byte(updateUserJSON), 0600); err != nil {
 		t.Fatalf("failed to write updateUserJSON: %v", err)
@@ -688,6 +706,9 @@ func TestNoSQLDAO_CreateUser_ReloadAtomicityOnDiskCorruption(t *testing.T) {
 		t.Fatalf("failed to create store: %v", err)
 	}
 	defer func() { _ = store.Close() }()
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("failed to migrate store: %v", err)
+	}
 
 	hash, _ := security.HashPassword("pass")
 	p := &models.UserProfile{ID: "local-user", Name: "Local User", Phone: "111"}
@@ -830,6 +851,9 @@ func TestNoSQLDAO_CandidateMergeIntegrity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create store: %v", err)
 	}
+	if err := initStore.Migrate(ctx); err != nil {
+		t.Fatalf("failed to migrate initStore: %v", err)
+	}
 	if _, err := initStore.CreateUser(ctx, &models.UserProfile{ID: "user1", Name: "Alice", Phone: "+1-555-0101"}, &models.UserCredential{Username: "alice", PasswordHash: hash}); err != nil {
 		t.Fatalf("failed to create user1: %v", err)
 	}
@@ -935,6 +959,9 @@ func TestNoSQLDAO_CreateUser_DiskIDCollisionRejection(t *testing.T) {
 		t.Fatalf("failed to create store1: %v", err)
 	}
 	defer func() { _ = store1.Close() }()
+	if err := store1.Migrate(ctx); err != nil {
+		t.Fatalf("failed to migrate store1: %v", err)
+	}
 
 	store2, err := NewNoSQLDAO(filePath)
 	if err != nil {
@@ -1075,6 +1102,9 @@ func TestNoSQLDAO_CreateUser_PopulatesCallerObjects(t *testing.T) {
 		t.Fatalf("failed to create store: %v", err)
 	}
 	defer func() { _ = store.Close() }()
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("failed to migrate store: %v", err)
+	}
 
 	hash, _ := security.HashPassword("pass")
 	p := &models.UserProfile{
@@ -1154,6 +1184,11 @@ func TestNoSQLDAO_MigrateDown_TearsDownCollectionAndData(t *testing.T) {
 		t.Errorf("expected ErrUserNotFound for credential after MigrateDown rollback, got %v", err)
 	}
 
+	// Verify CreateUser is blocked after rollback to version 0
+	if _, err := store.CreateUser(ctx, p, c); err == nil {
+		t.Error("expected CreateUser to fail after MigrateDown rollback, got nil")
+	}
+
 	// Reopen file in separate DAO instance: must be version 0 and empty
 	reopened, err := NewNoSQLDAO(filePath)
 	if err != nil {
@@ -1167,6 +1202,19 @@ func TestNoSQLDAO_MigrateDown_TearsDownCollectionAndData(t *testing.T) {
 	}
 	if _, err := reopened.GetProfile(ctx, id); !errors.Is(err, ErrUserNotFound) {
 		t.Errorf("expected ErrUserNotFound on reopened store after rollback, got %v", err)
+	}
+	// Verify CreateUser is also blocked on reopened unmigrated store
+	if _, err := reopened.CreateUser(ctx, p, c); err == nil {
+		t.Error("expected CreateUser to fail on reopened store with version 0, got nil")
+	}
+
+	// Migrate reopened store -> CreateUser should succeed again
+	if _, err := reopened.MigrateUp(ctx); err != nil {
+		t.Fatalf("failed to migrate reopened store: %v", err)
+	}
+	newID, err := reopened.CreateUser(ctx, p, c)
+	if err != nil || newID == "" {
+		t.Fatalf("expected CreateUser to succeed after migrating up, got id %q, err %v", newID, err)
 	}
 }
 

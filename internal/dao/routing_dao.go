@@ -215,12 +215,33 @@ func (r *RoutingDAO) CreateUser(ctx context.Context, profile *models.UserProfile
 	r.mu.RLock()
 	mode := r.mode
 	primary, secondary := r.targets()
+	fallback := r.fallback()
 	logger := r.logger
 	errHandler := r.onSecondaryError
 	r.mu.RUnlock()
 
 	if primary == nil {
 		return "", errors.New("no active primary datastore configured")
+	}
+
+	// Preflight check: if an alternate/fallback datastore is configured,
+	// verify that the requested username does not already exist in the alternate store.
+	// This prevents duplicate username collisions during migration/cutover windows
+	// and in standalone modes with an alternate datastore configured.
+	if fallback != nil {
+		if existingCred, altErr := fallback.GetCredential(ctx, cred.Username); altErr == nil && existingCred != nil {
+			return "", ErrUsernameTaken
+		} else if altErr != nil && !errors.Is(altErr, ErrUserNotFound) {
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
+			// Transient error checking alternate datastore: log warning, continue isolating transient failures
+			logger.Warn("alternate datastore preflight credential check encountered transient error",
+				slog.String("operation", "CreateUser"),
+				slog.String("username", cred.Username),
+				slog.Any("error", altErr),
+			)
+		}
 	}
 
 	// Write to active primary datastore
@@ -246,6 +267,19 @@ func (r *RoutingDAO) CreateUser(ctx context.Context, profile *models.UserProfile
 		}
 
 		if _, secErr := secondary.CreateUser(ctx, &profCopy, &credCopy); secErr != nil {
+			if errors.Is(secErr, ErrUsernameTaken) {
+				logger.Error("secondary datastore replication write failed due to username conflict",
+					slog.String("operation", "CreateUser"),
+					slog.String("mode", string(mode)),
+					slog.String("user_id", id),
+					slog.String("username", cred.Username),
+					slog.Any("error", secErr),
+				)
+				if errHandler != nil {
+					errHandler("CreateUser", secErr)
+				}
+				return "", ErrUsernameTaken
+			}
 			logger.Warn("secondary datastore replication write failed",
 				slog.String("operation", "CreateUser"),
 				slog.String("mode", string(mode)),

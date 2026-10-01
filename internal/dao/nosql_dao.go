@@ -358,6 +358,10 @@ func (d *NoSQLDAO) CreateUser(ctx context.Context, profile *models.UserProfile, 
 		d.byUsername = candidateByUsername
 	}
 
+	if !d.migrated {
+		return "", errors.New("nosql datastore schema is not migrated: collection unavailable")
+	}
+
 	if strings.TrimSpace(cred.Username) == "" || strings.TrimSpace(cred.PasswordHash) == "" {
 		return "", fmt.Errorf("%w: username and password_hash are required", ErrInvalidInput)
 	}

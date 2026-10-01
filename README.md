@@ -147,6 +147,7 @@ The service supports both relational (SQLite, PostgreSQL, CockroachDB) and docum
   To protect against data unavailability during phased database cutovers prior to historical data backfill completion:
   * **Point Reads (`GetProfile`, `GetCredential`, `VerifyUserCredential`)**: Executed against the primary store; if the record is missing and an alternate datastore is configured, the router queries the alternate store as a fallback.
   * **Search Queries (`SearchProfiles`)**: When both datastores are configured, searches query both backends in bounded pages, merge and deduplicate matching records by user ID (preserving primary records on collision), sort deterministically (`CreatedAt DESC, id DESC`), and apply pagination offset/limit.
+  * **Cross-Datastore Identity & Uniqueness Preflight**: To prevent duplicate accounts or identity collisions during migration/cutover windows, `CreateUser` preflights the alternate datastore's credential index before committing to the primary. If the username is already registered in either store, `ErrUsernameTaken` (HTTP 409 Conflict) is returned. In dual-write mode, secondary unique constraint violations are rejected rather than treated as transient replication errors.
 * **Environment Configuration**:
   ```bash
   # Standalone NoSQL mode (in-memory or file-backed JSON document store)

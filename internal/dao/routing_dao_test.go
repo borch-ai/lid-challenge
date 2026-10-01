@@ -345,6 +345,7 @@ func TestRoutingDAO_DualWriteNoSQLPrimary_WithRealSQLiteAndNoSQL(t *testing.T) {
 		t.Fatalf("failed to create nosql: %v", err)
 	}
 	defer func() { _ = nosqlDAO.Close() }()
+	_ = nosqlDAO.Migrate(ctx)
 
 	r, err := NewRoutingDAO(PersistenceModeDualWriteNoSQLPrimary, sqliteDAO, nosqlDAO, nil)
 	if err != nil {
@@ -893,6 +894,7 @@ func TestRoutingDAO_NormalizedReplication_NoSQLPrimary(t *testing.T) {
 		t.Fatalf("failed to create nosql dao: %v", err)
 	}
 	defer func() { _ = nosqlDAO.Close() }()
+	_ = nosqlDAO.Migrate(ctx)
 
 	r, err := NewRoutingDAO(PersistenceModeDualWriteNoSQLPrimary, sqlDAO, nosqlDAO, nil)
 	if err != nil {
@@ -940,6 +942,7 @@ func TestRoutingDAO_ReadFallback_NoSQLToSQL(t *testing.T) {
 		t.Fatalf("failed to create nosql: %v", err)
 	}
 	defer func() { _ = nosqlDAO.Close() }()
+	_ = nosqlDAO.Migrate(ctx)
 
 	// Directly insert a user into NoSQL only (e.g., written during nosql_only mode)
 	hash, _ := security.HashPassword("nosqlpass")
@@ -1002,6 +1005,7 @@ func TestRoutingDAO_SearchProfiles_MergeAndDeduplicate(t *testing.T) {
 		t.Fatalf("failed to create nosql: %v", err)
 	}
 	defer func() { _ = nosqlDAO.Close() }()
+	_ = nosqlDAO.Migrate(ctx)
 
 	hash, _ := security.HashPassword("pass")
 
@@ -1085,6 +1089,7 @@ func TestRoutingDAO_SearchProfiles_ExceedsSinglePageCap(t *testing.T) {
 		t.Fatalf("failed to create nosql: %v", err)
 	}
 	defer func() { _ = nosqlDAO.Close() }()
+	_ = nosqlDAO.Migrate(ctx)
 
 	hash, _ := security.HashPassword("pass")
 
@@ -1152,6 +1157,7 @@ func TestRoutingDAO_SearchProfiles_ErrorAndEdgeCases(t *testing.T) {
 		t.Fatalf("failed to create nosql: %v", err)
 	}
 	defer func() { _ = nosqlDAO.Close() }()
+	_ = nosqlDAO.Migrate(ctx)
 
 	hash, _ := security.HashPassword("pass")
 	if _, err := nosqlDAO.CreateUser(ctx, &models.UserProfile{ID: "p1", Name: "Alpha", Phone: "111"}, &models.UserCredential{Username: "u1", PasswordHash: hash}); err != nil {
@@ -1234,6 +1240,138 @@ func TestRoutingDAO_SearchProfiles_ContextCanceled(t *testing.T) {
 	rFallbackCanceled, _ := NewRoutingDAO(PersistenceModeDualWriteNoSQLPrimary, fallbackCanceled, nosqlDAO, nil)
 	if _, err := rFallbackCanceled.SearchProfiles(ctx2, models.SearchQuery{}); !errors.Is(err, context.Canceled) {
 		t.Errorf("expected context.Canceled propagated from fallback, got: %v", err)
+	}
+}
+
+func TestRoutingDAO_AlternateDatastore_UsernameConflictPreflight(t *testing.T) {
+	ctx := context.Background()
+	hash, _ := security.HashPassword("secretpass")
+
+	// Case 1: Standalone sql_only mode with configured NoSQL fallback
+	// A user "historical_user" exists only in NoSQL. Attempting to create "historical_user" via RoutingDAO in sql_only
+	// must be rejected with ErrUsernameTaken to prevent identity collision with fallback data.
+	sqliteDAO1, _ := NewSQLiteDAO("file::memory:?cache=shared")
+	defer func() { _ = sqliteDAO1.Close() }()
+	_ = sqliteDAO1.Migrate(ctx)
+
+	nosqlDAO1, _ := NewNoSQLDAO("memory://")
+	defer func() { _ = nosqlDAO1.Close() }()
+	_ = nosqlDAO1.Migrate(ctx)
+
+	// Prepopulate NoSQL with "historical_user"
+	_, err := nosqlDAO1.CreateUser(ctx, &models.UserProfile{ID: "nosql-u1", Name: "Historical NoSQL", Phone: "111"}, &models.UserCredential{Username: "historical_user", PasswordHash: hash})
+	if err != nil {
+		t.Fatalf("failed prepopulating NoSQL: %v", err)
+	}
+
+	rSQLOnly, err := NewRoutingDAO(PersistenceModeSQLOnly, sqliteDAO1, nosqlDAO1, nil)
+	if err != nil {
+		t.Fatalf("failed to create routing dao: %v", err)
+	}
+
+	_, err = rSQLOnly.CreateUser(ctx, &models.UserProfile{Name: "New SQL", Phone: "222"}, &models.UserCredential{Username: "historical_user", PasswordHash: hash})
+	if !errors.Is(err, ErrUsernameTaken) {
+		t.Errorf("expected ErrUsernameTaken when username exists in NoSQL fallback, got: %v", err)
+	}
+	// Verify primary SQL datastore was not written to
+	if _, err := sqliteDAO1.GetCredential(ctx, "historical_user"); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("expected primary SQL datastore to remain empty, got: %v", err)
+	}
+
+	// Case 2: Standalone nosql_only mode with configured SQL fallback
+	// A user "sql_user" exists only in SQL. Attempting to create "sql_user" via RoutingDAO in nosql_only
+	// must be rejected with ErrUsernameTaken.
+	sqliteDAO2, _ := NewSQLiteDAO("file::memory:?cache=shared")
+	defer func() { _ = sqliteDAO2.Close() }()
+	_ = sqliteDAO2.Migrate(ctx)
+
+	nosqlDAO2, _ := NewNoSQLDAO("memory://")
+	defer func() { _ = nosqlDAO2.Close() }()
+	_ = nosqlDAO2.Migrate(ctx)
+
+	// Prepopulate SQL with "sql_user"
+	_, err = sqliteDAO2.CreateUser(ctx, &models.UserProfile{ID: "sql-u2", Name: "Historical SQL", Phone: "333"}, &models.UserCredential{Username: "sql_user", PasswordHash: hash})
+	if err != nil {
+		t.Fatalf("failed prepopulating SQL: %v", err)
+	}
+
+	rNoSQLOnly, err := NewRoutingDAO(PersistenceModeNoSQLOnly, sqliteDAO2, nosqlDAO2, nil)
+	if err != nil {
+		t.Fatalf("failed to create routing dao: %v", err)
+	}
+
+	_, err = rNoSQLOnly.CreateUser(ctx, &models.UserProfile{Name: "New NoSQL", Phone: "444"}, &models.UserCredential{Username: "sql_user", PasswordHash: hash})
+	if !errors.Is(err, ErrUsernameTaken) {
+		t.Errorf("expected ErrUsernameTaken when username exists in SQL fallback, got: %v", err)
+	}
+	// Verify primary NoSQL datastore was not written to
+	if _, err := nosqlDAO2.GetCredential(ctx, "sql_user"); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("expected primary NoSQL datastore to remain empty, got: %v", err)
+	}
+
+	// Case 3: Dual-write mode preflight
+	// Username exists in secondary NoSQL -> preflight rejects immediately without writing to primary SQL.
+	sqliteDAO3, _ := NewSQLiteDAO("file::memory:?cache=shared")
+	defer func() { _ = sqliteDAO3.Close() }()
+	_ = sqliteDAO3.Migrate(ctx)
+
+	nosqlDAO3, _ := NewNoSQLDAO("memory://")
+	defer func() { _ = nosqlDAO3.Close() }()
+	_ = nosqlDAO3.Migrate(ctx)
+
+	_, err = nosqlDAO3.CreateUser(ctx, &models.UserProfile{ID: "nosql-u3", Name: "Existing Secondary", Phone: "555"}, &models.UserCredential{Username: "dup_user", PasswordHash: hash})
+	if err != nil {
+		t.Fatalf("failed prepopulating NoSQL: %v", err)
+	}
+
+	rDual, err := NewRoutingDAO(PersistenceModeDualWrite, sqliteDAO3, nosqlDAO3, nil)
+	if err != nil {
+		t.Fatalf("failed to create routing dao: %v", err)
+	}
+
+	_, err = rDual.CreateUser(ctx, &models.UserProfile{Name: "Dual User", Phone: "666"}, &models.UserCredential{Username: "dup_user", PasswordHash: hash})
+	if !errors.Is(err, ErrUsernameTaken) {
+		t.Errorf("expected ErrUsernameTaken in dual_write preflight, got: %v", err)
+	}
+	if _, err := sqliteDAO3.GetCredential(ctx, "dup_user"); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("expected primary SQL store not to be written to during preflight rejection, got: %v", err)
+	}
+}
+
+func TestRoutingDAO_SecondaryUsernameConflict_FailsCreate(t *testing.T) {
+	ctx := context.Background()
+	hash, _ := security.HashPassword("secretpass")
+
+	primary, _ := NewSQLiteDAO("file::memory:?cache=shared")
+	defer func() { _ = primary.Close() }()
+	_ = primary.Migrate(ctx)
+
+	// mockSecondary returns ErrUserNotFound on GetCredential (so preflight passes),
+	// but returns ErrUsernameTaken on CreateUser (e.g. concurrent race condition).
+	mockSecondary := &mockErrorDAO{createErr: ErrUsernameTaken}
+
+	r, err := NewRoutingDAO(PersistenceModeDualWrite, primary, mockSecondary, nil)
+	if err != nil {
+		t.Fatalf("failed to create routing dao: %v", err)
+	}
+
+	var secondaryErrorOp string
+	var secondaryErrorCaptured error
+	r.SetOnSecondaryError(func(op string, err error) {
+		secondaryErrorOp = op
+		secondaryErrorCaptured = err
+	})
+
+	prof := &models.UserProfile{Name: "Conflict User", Phone: "+1-555-0999"}
+	cred := &models.UserCredential{Username: "conflict_user", PasswordHash: hash}
+
+	// Unlike transient errors, ErrUsernameTaken from secondary must reject the create call!
+	_, err = r.CreateUser(ctx, prof, cred)
+	if !errors.Is(err, ErrUsernameTaken) {
+		t.Fatalf("expected ErrUsernameTaken when secondary rejects with duplicate username, got: %v", err)
+	}
+	if secondaryErrorOp != "CreateUser" || !errors.Is(secondaryErrorCaptured, ErrUsernameTaken) {
+		t.Errorf("expected secondary error callback with ErrUsernameTaken, got op: %q, err: %v", secondaryErrorOp, secondaryErrorCaptured)
 	}
 }
 

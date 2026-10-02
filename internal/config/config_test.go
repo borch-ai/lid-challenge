@@ -279,4 +279,71 @@ func TestLoadDBConfig(t *testing.T) {
 	if dbCfg.MigrateOnStartup != false {
 		t.Errorf("expected migrate on startup false, got %v", dbCfg.MigrateOnStartup)
 	}
+	if dbCfg.PersistenceMode != "sql_only" {
+		t.Errorf("expected default persistence mode 'sql_only', got %q", dbCfg.PersistenceMode)
+	}
 }
+
+func TestConfigLoad_PersistenceMode(t *testing.T) {
+	t.Setenv("APP_ENV", "development")
+
+	t.Run("default_sql_only", func(t *testing.T) {
+		t.Setenv("PERSISTENCE_MODE", "")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.PersistenceMode != "sql_only" {
+			t.Errorf("expected default sql_only, got %q", cfg.PersistenceMode)
+		}
+	})
+
+	t.Run("dual_write_with_secondary", func(t *testing.T) {
+		t.Setenv("PERSISTENCE_MODE", "dual_write")
+		t.Setenv("SECONDARY_DB_DRIVER", "nosql")
+		t.Setenv("SECONDARY_DB_DSN", "memory://")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.PersistenceMode != "dual_write" {
+			t.Errorf("expected dual_write, got %q", cfg.PersistenceMode)
+		}
+		if cfg.SecondaryDBDriver != "nosql" {
+			t.Errorf("expected secondary driver nosql, got %q", cfg.SecondaryDBDriver)
+		}
+		if cfg.SecondaryDBDSN != "memory://" {
+			t.Errorf("expected secondary dsn memory://, got %q", cfg.SecondaryDBDSN)
+		}
+	})
+
+	t.Run("alias_canonicalization", func(t *testing.T) {
+		t.Setenv("PERSISTENCE_MODE", "dual-write")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.PersistenceMode != "dual_write" {
+			t.Errorf("expected canonical mode dual_write, got %q", cfg.PersistenceMode)
+		}
+
+		dbCfg, err := LoadDBConfig()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if dbCfg.PersistenceMode != "dual_write" {
+			t.Errorf("expected canonical mode dual_write in dbCfg, got %q", dbCfg.PersistenceMode)
+		}
+	})
+
+	t.Run("invalid_persistence_mode", func(t *testing.T) {
+		t.Setenv("PERSISTENCE_MODE", "invalid_mode_xyz")
+		if _, err := Load(); err == nil {
+			t.Error("expected error for invalid PERSISTENCE_MODE in Load()")
+		}
+		if _, err := LoadDBConfig(); err == nil {
+			t.Error("expected error for invalid PERSISTENCE_MODE in LoadDBConfig()")
+		}
+	})
+}
+

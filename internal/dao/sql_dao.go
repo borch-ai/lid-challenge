@@ -380,6 +380,46 @@ func (s *SQLDAO) GetProfile(ctx context.Context, userID string) (*models.UserPro
 	return &p, nil
 }
 
+// DeleteUser removes a user profile and associated credentials atomically.
+func (s *SQLDAO) DeleteUser(ctx context.Context, userID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(userID) == "" {
+		return ErrInvalidInput
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	credQuery := s.dialect.Rebind("DELETE FROM user_credential WHERE user_id = ?")
+	if _, err := tx.ExecContext(ctx, credQuery, userID); err != nil {
+		return fmt.Errorf("failed to delete user credential: %w", err)
+	}
+
+	profQuery := s.dialect.Rebind("DELETE FROM user_profile WHERE id = ?")
+	res, err := tx.ExecContext(ctx, profQuery, userID)
+	if err != nil {
+		return fmt.Errorf("failed to delete user profile: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to check affected rows: %w", err)
+	}
+	if rows == 0 {
+		return ErrUserNotFound
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+	return nil
+}
+
 // escapeLike escapes SQL LIKE wildcard characters ('%', '_', and the escape character '\').
 func escapeLike(s string) string {
 	var b strings.Builder

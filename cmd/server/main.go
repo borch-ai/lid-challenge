@@ -19,14 +19,114 @@ import (
 	"github.com/borch-ai/lid-challenge/internal/dao"
 )
 
+func isNoSQLDriver(driver string) bool {
+	switch strings.ToLower(strings.TrimSpace(driver)) {
+	case "nosql", "document", "memory":
+		return true
+	default:
+		return false
+	}
+}
+
 func initUserDAO(driver, dsn string) (dao.UserDAO, error) {
 	switch strings.ToLower(strings.TrimSpace(driver)) {
 	case "sqlite", "sqlite3":
 		return dao.NewSQLiteDAO(dsn)
 	case "postgres", "postgresql", "cockroach", "cockroachdb":
 		return dao.NewPostgresDAO(dsn)
+	case "memory":
+		return dao.NewNoSQLDAO("memory://")
+	case "nosql", "document":
+		return dao.NewNoSQLDAO(dsn)
 	default:
 		return nil, fmt.Errorf("unsupported database driver: %s", driver)
+	}
+}
+
+func validatePersistenceModeDrivers(mode dao.PersistenceMode, primaryDriver, secondaryDriver string) error {
+	switch mode {
+	case dao.PersistenceModeSQLOnly:
+		if isNoSQLDriver(primaryDriver) {
+			return fmt.Errorf("persistence mode %q requires a SQL primary driver, but primary driver is %q", mode, primaryDriver)
+		}
+		if secondaryDriver != "" && !isNoSQLDriver(secondaryDriver) {
+			return fmt.Errorf("persistence mode %q requires any secondary driver to be a NoSQL driver (got %q); configuring a secondary SQL driver in SQL-only mode is unsupported", mode, secondaryDriver)
+		}
+	case dao.PersistenceModeNoSQLOnly:
+		if !isNoSQLDriver(primaryDriver) {
+			return fmt.Errorf("persistence mode %q requires a NoSQL primary driver, but primary driver is %q", mode, primaryDriver)
+		}
+		if secondaryDriver != "" && isNoSQLDriver(secondaryDriver) {
+			return fmt.Errorf("persistence mode %q requires any secondary driver to be a SQL driver (got %q); configuring a secondary NoSQL driver in NoSQL-only mode is unsupported", mode, secondaryDriver)
+		}
+	case dao.PersistenceModeDualWrite:
+		if secondaryDriver == "" {
+			return fmt.Errorf("secondary database driver must be configured when dual-write persistence mode (%s) is active", mode)
+		}
+		if isNoSQLDriver(primaryDriver) {
+			return fmt.Errorf("persistence mode %q requires a SQL primary driver, but primary driver is %q", mode, primaryDriver)
+		}
+		if !isNoSQLDriver(secondaryDriver) {
+			return fmt.Errorf("persistence mode %q requires a NoSQL secondary driver, but secondary driver is %q", mode, secondaryDriver)
+		}
+	case dao.PersistenceModeDualWriteNoSQLPrimary:
+		if secondaryDriver == "" {
+			return fmt.Errorf("secondary database driver must be configured when dual-write persistence mode (%s) is active", mode)
+		}
+		if !isNoSQLDriver(primaryDriver) {
+			return fmt.Errorf("persistence mode %q requires a NoSQL primary driver, but primary driver is %q", mode, primaryDriver)
+		}
+		if isNoSQLDriver(secondaryDriver) {
+			return fmt.Errorf("persistence mode %q requires a SQL secondary driver, but secondary driver is %q", mode, secondaryDriver)
+		}
+	}
+	return nil
+}
+
+func validatePersistenceConfig(modeStr, primaryDriver, primaryDSN, secondaryDriver, secondaryDSN string) error {
+	mode, err := dao.ParsePersistenceMode(modeStr)
+	if err != nil {
+		return err
+	}
+	if err := validatePersistenceModeDrivers(mode, primaryDriver, secondaryDriver); err != nil {
+		return err
+	}
+	trimmedPriDriver := strings.ToLower(strings.TrimSpace(primaryDriver))
+	if trimmedPriDriver != "" && trimmedPriDriver != "memory" && strings.TrimSpace(primaryDSN) == "" {
+		return fmt.Errorf("primary database DSN must be configured for primary driver %q (use %q driver for explicit in-memory storage)", primaryDriver, "memory")
+	}
+	trimmedSecDriver := strings.ToLower(strings.TrimSpace(secondaryDriver))
+	if trimmedSecDriver != "" && trimmedSecDriver != "memory" && strings.TrimSpace(secondaryDSN) == "" {
+		return fmt.Errorf("secondary database DSN must be configured for secondary driver %q (use %q driver for explicit in-memory storage)", secondaryDriver, "memory")
+	}
+	return nil
+}
+
+func buildRoutingDAO(mode dao.PersistenceMode, driver1 string, dao1 dao.UserDAO, driver2 string, dao2 dao.UserDAO, logger *slog.Logger) (*dao.RoutingDAO, error) {
+	if err := validatePersistenceModeDrivers(mode, driver1, driver2); err != nil {
+		return nil, err
+	}
+	switch mode {
+	case dao.PersistenceModeSQLOnly:
+		var nosqlDAO dao.UserDAO
+		if driver2 != "" {
+			nosqlDAO = dao2
+		}
+		return dao.NewRoutingDAO(mode, dao1, nosqlDAO, logger)
+	case dao.PersistenceModeNoSQLOnly:
+		var sqlDAO dao.UserDAO
+		if driver2 != "" {
+			sqlDAO = dao2
+		}
+		return dao.NewRoutingDAO(mode, sqlDAO, dao1, logger)
+	case dao.PersistenceModeDualWrite:
+		// driver1 is SQL (primary), driver2 is NoSQL (secondary)
+		return dao.NewRoutingDAO(mode, dao1, dao2, logger)
+	case dao.PersistenceModeDualWriteNoSQLPrimary:
+		// driver1 is NoSQL (primary), driver2 is SQL (secondary)
+		return dao.NewRoutingDAO(mode, dao2, dao1, logger)
+	default:
+		return nil, fmt.Errorf("unsupported persistence mode: %s", mode)
 	}
 }
 
@@ -47,14 +147,42 @@ func main() {
 			Level: logLevel,
 		}))
 
-		userDAO, err := initUserDAO(dbCfg.Driver, dbCfg.DSN)
+		if err := validatePersistenceConfig(dbCfg.PersistenceMode, dbCfg.Driver, dbCfg.DSN, dbCfg.SecondaryDriver, dbCfg.SecondaryDSN); err != nil {
+			logger.Error("invalid persistence configuration", slog.Any("error", err))
+			os.Exit(1)
+		}
+
+		primaryDAO, err := initUserDAO(dbCfg.Driver, dbCfg.DSN)
 		if err != nil {
 			logger.Error("failed to connect to database", slog.Any("error", err))
 			os.Exit(1)
 		}
 		defer func() {
-			_ = userDAO.Close()
+			_ = primaryDAO.Close()
 		}()
+
+		userDAO := primaryDAO
+		if dbCfg.SecondaryDriver != "" || dbCfg.PersistenceMode == string(dao.PersistenceModeDualWrite) || dbCfg.PersistenceMode == string(dao.PersistenceModeDualWriteNoSQLPrimary) {
+			if dbCfg.SecondaryDriver != "" {
+				secDAO, err := initUserDAO(dbCfg.SecondaryDriver, dbCfg.SecondaryDSN)
+				if err != nil {
+					logger.Error("failed to connect to secondary database", slog.Any("error", err))
+					os.Exit(1)
+				}
+				defer func() {
+					_ = secDAO.Close()
+				}()
+				rDAO, err := buildRoutingDAO(dao.PersistenceMode(dbCfg.PersistenceMode), dbCfg.Driver, primaryDAO, dbCfg.SecondaryDriver, secDAO, logger)
+				if err != nil {
+					logger.Error("failed to initialize routing DAO", slog.Any("error", err))
+					os.Exit(1)
+				}
+				userDAO = rDAO
+			} else if dbCfg.PersistenceMode == string(dao.PersistenceModeDualWrite) || dbCfg.PersistenceMode == string(dao.PersistenceModeDualWriteNoSQLPrimary) {
+				logger.Error("secondary database driver must be configured when dual-write persistence mode is active")
+				os.Exit(1)
+			}
+		}
 
 		runMigrationCLI(userDAO, os.Args[2:], logger)
 		return
@@ -76,18 +204,47 @@ func main() {
 
 	logger.Info("starting LID Challenge service",
 		slog.String("db_driver", cfg.DBDriver),
+		slog.String("persistence_mode", cfg.PersistenceMode),
 		slog.Int("port", cfg.Server.Port),
 	)
 
-	// Initialize database DAO based on driver
-	userDAO, err := initUserDAO(cfg.DBDriver, cfg.DBDSN)
+	if err := validatePersistenceConfig(cfg.PersistenceMode, cfg.DBDriver, cfg.DBDSN, cfg.SecondaryDBDriver, cfg.SecondaryDBDSN); err != nil {
+		logger.Error("invalid persistence configuration", slog.Any("error", err))
+		os.Exit(1)
+	}
+
+	// Initialize primary database DAO based on driver
+	primaryDAO, err := initUserDAO(cfg.DBDriver, cfg.DBDSN)
 	if err != nil {
 		logger.Error("failed to connect to database", slog.Any("error", err))
 		os.Exit(1)
 	}
 	defer func() {
-		_ = userDAO.Close()
+		_ = primaryDAO.Close()
 	}()
+
+	userDAO := primaryDAO
+	if cfg.SecondaryDBDriver != "" || cfg.PersistenceMode == string(dao.PersistenceModeDualWrite) || cfg.PersistenceMode == string(dao.PersistenceModeDualWriteNoSQLPrimary) {
+		if cfg.SecondaryDBDriver != "" {
+			secDAO, err := initUserDAO(cfg.SecondaryDBDriver, cfg.SecondaryDBDSN)
+			if err != nil {
+				logger.Error("failed to connect to secondary database", slog.Any("error", err))
+				os.Exit(1)
+			}
+			defer func() {
+				_ = secDAO.Close()
+			}()
+			rDAO, err := buildRoutingDAO(dao.PersistenceMode(cfg.PersistenceMode), cfg.DBDriver, primaryDAO, cfg.SecondaryDBDriver, secDAO, logger)
+			if err != nil {
+				logger.Error("failed to initialize routing DAO", slog.Any("error", err))
+				os.Exit(1)
+			}
+			userDAO = rDAO
+		} else if cfg.PersistenceMode == string(dao.PersistenceModeDualWrite) || cfg.PersistenceMode == string(dao.PersistenceModeDualWriteNoSQLPrimary) {
+			logger.Error("secondary database driver must be configured when dual-write persistence mode is active")
+			os.Exit(1)
+		}
+	}
 
 	// Execute migrations on startup if enabled
 	if cfg.MigrateOnStartup {

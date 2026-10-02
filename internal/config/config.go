@@ -12,6 +12,7 @@ import (
 
 	"github.com/borch-ai/lid-challenge/internal/api"
 	"github.com/borch-ai/lid-challenge/internal/connector"
+	"github.com/borch-ai/lid-challenge/internal/dao"
 )
 
 // DBConfig contains database connection parameters needed for database operations like migrations.
@@ -20,6 +21,9 @@ type DBConfig struct {
 	DSN              string
 	Debug            bool
 	MigrateOnStartup bool
+	PersistenceMode  string
+	SecondaryDriver  string
+	SecondaryDSN     string
 }
 
 // LoadDBConfig loads only the database configuration parameters without requiring application or vendor secrets.
@@ -28,12 +32,21 @@ func LoadDBConfig() (*DBConfig, error) {
 	dsn := getEnv("DB_DSN", "lid.db")
 	debug := getEnvBool("DEBUG", false)
 	migrateOnStartup := getEnvBool("MIGRATE_ON_STARTUP", true)
+	mode, err := dao.ParsePersistenceMode(getEnv("PERSISTENCE_MODE", "sql_only"))
+	if err != nil {
+		return nil, err
+	}
+	secondaryDriver := strings.ToLower(strings.TrimSpace(getEnv("SECONDARY_DB_DRIVER", "")))
+	secondaryDSN := getEnv("SECONDARY_DB_DSN", "")
 
 	return &DBConfig{
 		Driver:           driver,
 		DSN:              dsn,
 		Debug:            debug,
 		MigrateOnStartup: migrateOnStartup,
+		PersistenceMode:  string(mode),
+		SecondaryDriver:  secondaryDriver,
+		SecondaryDSN:     secondaryDSN,
 	}, nil
 }
 
@@ -44,6 +57,10 @@ type AppConfig struct {
 	DBDSN            string
 	Debug            bool
 	MigrateOnStartup bool
+
+	PersistenceMode   string
+	SecondaryDBDriver string
+	SecondaryDBDSN    string
 
 	VendorABC connector.VendorConfig
 	VendorXYZ connector.VendorConfig
@@ -123,6 +140,12 @@ func Load() (*AppConfig, error) {
 	}
 	debug := getEnvBool("DEBUG", false)
 	migrateOnStartup := getEnvBool("MIGRATE_ON_STARTUP", true)
+	mode, err := dao.ParsePersistenceMode(getEnv("PERSISTENCE_MODE", "sql_only"))
+	if err != nil {
+		return nil, err
+	}
+	secondaryDBDriver := strings.ToLower(strings.TrimSpace(getEnv("SECONDARY_DB_DRIVER", "")))
+	secondaryDBDSN := getEnv("SECONDARY_DB_DSN", "")
 
 	cfg := &AppConfig{
 		Server: api.Config{
@@ -132,10 +155,13 @@ func Load() (*AppConfig, error) {
 			RateLimitBurst: rateLimitBurst,
 			TrustedProxies: trustedProxies,
 		},
-		DBDriver:         dbDriver,
-		DBDSN:            dbDSN,
-		Debug:            debug,
-		MigrateOnStartup: migrateOnStartup,
+		DBDriver:          dbDriver,
+		DBDSN:             dbDSN,
+		Debug:             debug,
+		MigrateOnStartup:  migrateOnStartup,
+		PersistenceMode:   string(mode),
+		SecondaryDBDriver: secondaryDBDriver,
+		SecondaryDBDSN:    secondaryDBDSN,
 
 		VendorABC: connector.VendorConfig{
 			ProviderName:    "ABC",

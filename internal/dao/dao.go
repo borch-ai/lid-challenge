@@ -26,6 +26,9 @@ type UserDAO interface {
 	// GetProfile retrieves a user profile by unique user ID.
 	GetProfile(ctx context.Context, userID string) (*models.UserProfile, error)
 
+	// DeleteUser removes a user profile and associated credentials atomically.
+	DeleteUser(ctx context.Context, userID string) error
+
 	// SearchProfiles finds user profiles matching the search criteria.
 	SearchProfiles(ctx context.Context, query models.SearchQuery) ([]*models.UserProfile, error)
 

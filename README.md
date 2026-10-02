@@ -135,8 +135,43 @@ The service includes an embedded, version-tracked database schema migration engi
   # Roll back 1 migration step (or specify number of steps)
   ./bin/lid-server migrate down 1
   ```
-* **Decoupled Deployment & Startup Control**:
-  By default, `MIGRATE_ON_STARTUP=true` runs pending migrations on server boot. In containerized production environments (e.g. Kubernetes), operators can set `MIGRATE_ON_STARTUP=false` and run `lid-server migrate up` within an init container before starting replicas.
+### 8. Multi-Datastore Routing & NoSQL Support (Option B)
+The service supports both relational (SQLite, PostgreSQL, CockroachDB) and document/NoSQL datastores with deployment-level persistence routing:
+
+* **Persistence Modes (`PERSISTENCE_MODE`)**:
+  * `sql_only` *(default)*: All writes target the primary SQL store. If a secondary NoSQL datastore is configured, missing point reads fall back to NoSQL and profile searches merge and deduplicate across both backends.
+  * `dual_write`: Primary is SQL; successful writes synchronously replicate to the secondary NoSQL store with fault isolation. Point reads are served by SQL with fallback to NoSQL on misses, and profile searches merge and deduplicate across both backends.
+  * `dual_write_nosql_primary`: Primary is NoSQL; successful writes synchronously replicate to the secondary SQL store with fault isolation. Point reads are served by NoSQL with fallback to SQL on misses, and profile searches merge and deduplicate across both backends.
+  * `nosql_only`: All writes target the primary NoSQL store. If a secondary SQL datastore is configured, missing point reads fall back to SQL and profile searches merge and deduplicate across both backends.
+* **Pre-Backfill Read Fallback & Search Merge Semantics**:
+  To protect against data unavailability during phased database cutovers prior to historical data backfill completion:
+  * **Point Reads (`GetProfile`, `GetCredential`, `VerifyUserCredential`)**: Executed against the primary store; if the record is missing and an alternate datastore is configured, the router queries the alternate store as a fallback.
+  * **Search Queries (`SearchProfiles`)**: When both datastores are configured, searches query both backends in bounded pages, merge and deduplicate matching records by user ID (preserving primary records on collision), sort deterministically (`CreatedAt DESC, id DESC`), and apply pagination offset/limit.
+  * **Cross-Datastore Identity & Uniqueness Preflight**: To prevent duplicate accounts or identity collisions during migration/cutover windows, `CreateUser` preflights the alternate datastore's credential index before committing to the primary. If the username is already registered in either store, `ErrUsernameTaken` (HTTP 409 Conflict) is returned. In dual-write mode, secondary unique constraint violations are rejected rather than treated as transient replication errors.
+* **Environment Configuration**:
+  ```bash
+  # Standalone NoSQL mode (in-memory or file-backed JSON document store)
+  APP_ENV=development \
+    PERSISTENCE_MODE=nosql_only \
+    DB_DRIVER=nosql DB_DSN="lid_nosql.json" \
+    go run ./cmd/server/main.go
+
+  # Standalone NoSQL mode (pure in-memory)
+  APP_ENV=development \
+    PERSISTENCE_MODE=nosql_only \
+    DB_DRIVER=nosql DB_DSN="memory://" \
+    go run ./cmd/server/main.go
+
+  # Dual-write mode (SQL primary with NoSQL secondary replica)
+  APP_ENV=development \
+    DB_DRIVER=sqlite DB_DSN="lid.db" \
+    PERSISTENCE_MODE=dual_write \
+    SECONDARY_DB_DRIVER=nosql SECONDARY_DB_DSN="lid_nosql.json" \
+    go run ./cmd/server/main.go
+  ```
+* **Single-Process Scope & Production Scalability**:
+  File-backed NoSQL storage uses reload/merge semantics and process-isolated temporary files (`.tmp.<pid>.<ts>`), designed for single-process embedded deployments, local testing, and development. For multi-replica production environments requiring distributed concurrent writes, configure a networked datastore (PostgreSQL/CockroachDB).
+* **Future Option A Roadmap**: See [`TODO.md`](TODO.md) for dynamic feature flags (OpenFeature), live shadow reads, outbox CDC, and automated canary rollouts.
 
 ---
 

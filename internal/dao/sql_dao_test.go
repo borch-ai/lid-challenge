@@ -668,3 +668,39 @@ func TestSQLiteDAO_IsolatedInMemoryInstances(t *testing.T) {
 		t.Errorf("expected dao2 to be completely isolated and empty, got %d records", len(results))
 	}
 }
+
+func TestSQLDAO_DeleteUser(t *testing.T) {
+	dao := setupTestDAO(t)
+	ctx := context.Background()
+
+	hash, _ := security.HashPassword("hunter2")
+	p := &models.UserProfile{ID: "del-sql-1", Name: "Delete Me", Phone: "123"}
+	c := &models.UserCredential{Username: "del_sql", PasswordHash: hash}
+	id, err := dao.CreateUser(ctx, p, c)
+	if err != nil {
+		t.Fatalf("failed to create user: %v", err)
+	}
+
+	// Delete user
+	if err := dao.DeleteUser(ctx, id); err != nil {
+		t.Fatalf("expected DeleteUser to succeed, got: %v", err)
+	}
+	// Verify profile and credential are gone
+	if _, err := dao.GetProfile(ctx, id); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("expected ErrUserNotFound for profile after DeleteUser, got: %v", err)
+	}
+	if _, err := dao.GetCredential(ctx, "del_sql"); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("expected ErrUserNotFound for credential after DeleteUser, got: %v", err)
+	}
+
+	// Repeated delete returns ErrUserNotFound
+	if err := dao.DeleteUser(ctx, id); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("expected ErrUserNotFound on repeated delete, got: %v", err)
+	}
+
+	// Invalid input
+	if err := dao.DeleteUser(ctx, ""); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput on empty user ID, got: %v", err)
+	}
+}
+

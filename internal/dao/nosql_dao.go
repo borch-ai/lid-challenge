@@ -72,6 +72,9 @@ type nosqlFilePayload struct {
 func validateDocuments(filePath string, docs map[string]*userDocument) error {
 	seenUsernames := make(map[string]string, len(docs))
 	for id, doc := range docs {
+		if strings.TrimSpace(id) == "" {
+			return fmt.Errorf("document store file %q contains empty user ID", filePath)
+		}
 		if doc == nil {
 			return fmt.Errorf("document store file %q contains null document for user ID %q", filePath, id)
 		}

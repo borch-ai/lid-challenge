@@ -501,6 +501,15 @@ func TestNoSQLDAO_FilePersistence(t *testing.T) {
 		t.Error("expected error loading JSON file containing null document, got nil")
 	}
 
+	// Phase 7b: Reject empty document IDs in document map
+	emptyIDFile := filepath.Join(tmpDir, "emptyid.json")
+	if err := os.WriteFile(emptyIDFile, []byte(`{"": {"id": "", "profile": {"name": "Empty"}, "credential": {"username": "emptyuser"}}}`), 0600); err != nil {
+		t.Fatalf("failed to write emptyid file: %v", err)
+	}
+	if _, err := NewNoSQLDAO(emptyIDFile); err == nil {
+		t.Error("expected error loading JSON file containing empty document ID, got nil")
+	}
+
 	// Phase 8: Reject duplicate usernames when loading file store
 	dupUserJSON := `{
 		"user1": {"id": "user1", "profile": {"name": "U1", "phone": "123"}, "credential": {"username": "dupuser", "password_hash": "h1"}},

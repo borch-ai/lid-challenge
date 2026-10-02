@@ -450,6 +450,42 @@ func (d *NoSQLDAO) GetProfile(ctx context.Context, userID string) (*models.UserP
 	return &prof, nil
 }
 
+// DeleteUser removes a user profile and associated credentials atomically.
+func (d *NoSQLDAO) DeleteUser(ctx context.Context, userID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(userID) == "" {
+		return ErrInvalidInput
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.closed {
+		return errors.New("nosql dao is closed")
+	}
+
+	doc, exists := d.docs[userID]
+	if !exists {
+		return ErrUserNotFound
+	}
+
+	username := doc.Credential.Username
+	delete(d.docs, userID)
+	if username != "" {
+		delete(d.byUsername, username)
+	}
+
+	if err := d.persistLocked(false); err != nil {
+		d.docs[userID] = doc
+		if username != "" {
+			d.byUsername[username] = userID
+		}
+		return err
+	}
+	return nil
+}
+
 // SearchProfiles finds user profiles matching search criteria with pagination.
 // Semantics align with the relational SQL DAO: substring for Name/Phone, exact case-insensitive for Locality/Region/Country.
 func (d *NoSQLDAO) SearchProfiles(ctx context.Context, query models.SearchQuery) ([]*models.UserProfile, error) {

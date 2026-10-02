@@ -225,8 +225,8 @@ func (r *RoutingDAO) CreateUser(ctx context.Context, profile *models.UserProfile
 	}
 
 	// Preflight check: if an alternate/fallback datastore is configured,
-	// verify that the requested username does not already exist in the alternate store.
-	// This prevents duplicate username collisions during migration/cutover windows
+	// verify that the requested username and profile ID do not already exist in the alternate store.
+	// This prevents duplicate username and ID collisions during migration/cutover windows
 	// and in standalone modes with an alternate datastore configured.
 	// Fails closed if the alternate datastore cannot be queried to preserve uniqueness guarantees.
 	if fallback != nil {
@@ -236,6 +236,16 @@ func (r *RoutingDAO) CreateUser(ctx context.Context, profile *models.UserProfile
 		}
 		if altErr != nil && !errors.Is(altErr, ErrUserNotFound) {
 			return "", fmt.Errorf("failed to verify username uniqueness against alternate datastore: %w", altErr)
+		}
+
+		if profile.ID != "" {
+			existingProf, profErr := fallback.GetProfile(ctx, profile.ID)
+			if profErr == nil && existingProf != nil {
+				return "", fmt.Errorf("user with ID %q already exists in alternate datastore: %w", profile.ID, ErrInvalidInput)
+			}
+			if profErr != nil && !errors.Is(profErr, ErrUserNotFound) {
+				return "", fmt.Errorf("failed to verify profile ID uniqueness against alternate datastore: %w", profErr)
+			}
 		}
 	}
 
@@ -262,18 +272,24 @@ func (r *RoutingDAO) CreateUser(ctx context.Context, profile *models.UserProfile
 		}
 
 		if _, secErr := secondary.CreateUser(ctx, &profCopy, &credCopy); secErr != nil {
-			if errors.Is(secErr, ErrUsernameTaken) {
-				logger.Error("secondary datastore replication write failed due to username conflict",
+			if errors.Is(secErr, ErrUsernameTaken) || errors.Is(secErr, ErrInvalidInput) {
+				logger.Error("secondary datastore replication write failed due to fatal identity conflict; executing compensating primary rollback",
 					slog.String("operation", "CreateUser"),
 					slog.String("mode", string(mode)),
 					slog.String("user_id", id),
 					slog.String("username", cred.Username),
 					slog.Any("error", secErr),
 				)
+				if compErr := primary.DeleteUser(ctx, id); compErr != nil {
+					logger.Error("failed to execute compensating primary rollback after secondary conflict",
+						slog.String("user_id", id),
+						slog.Any("rollback_error", compErr),
+					)
+				}
 				if errHandler != nil {
 					errHandler("CreateUser", secErr)
 				}
-				return "", ErrUsernameTaken
+				return "", secErr
 			}
 			logger.Warn("secondary datastore replication write failed",
 				slog.String("operation", "CreateUser"),
@@ -306,6 +322,28 @@ func (r *RoutingDAO) GetProfile(ctx context.Context, userID string) (*models.Use
 		return fallback.GetProfile(ctx, userID)
 	}
 	return prof, err
+}
+
+// DeleteUser removes a user profile and associated credentials across configured datastores.
+func (r *RoutingDAO) DeleteUser(ctx context.Context, userID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.mu.RLock()
+	primary, secondary := r.targets()
+	r.mu.RUnlock()
+
+	if primary == nil {
+		return errors.New("no active primary datastore configured")
+	}
+
+	if err := primary.DeleteUser(ctx, userID); err != nil {
+		return err
+	}
+	if secondary != nil {
+		_ = secondary.DeleteUser(ctx, userID)
+	}
+	return nil
 }
 
 // fetchUpTo retrieves up to targetCount matching profiles from dao using bounded pages of up to 100.

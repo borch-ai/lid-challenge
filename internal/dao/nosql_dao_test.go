@@ -1218,5 +1218,42 @@ func TestNoSQLDAO_MigrateDown_TearsDownCollectionAndData(t *testing.T) {
 	}
 }
 
+func TestNoSQLDAO_DeleteUser(t *testing.T) {
+	ctx := context.Background()
+	store, err := NewNoSQLDAO("")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+	_ = store.Migrate(ctx)
+
+	hash, _ := security.HashPassword("pass")
+	p := &models.UserProfile{ID: "del-nosql-1", Name: "Delete Me", Phone: "123"}
+	c := &models.UserCredential{Username: "del_nosql", PasswordHash: hash}
+	id, err := store.CreateUser(ctx, p, c)
+	if err != nil {
+		t.Fatalf("failed to create user: %v", err)
+	}
+
+	if err := store.DeleteUser(ctx, id); err != nil {
+		t.Fatalf("expected DeleteUser to succeed, got: %v", err)
+	}
+	if _, err := store.GetProfile(ctx, id); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("expected ErrUserNotFound for profile after DeleteUser, got: %v", err)
+	}
+	if _, err := store.GetCredential(ctx, "del_nosql"); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("expected ErrUserNotFound for credential after DeleteUser, got: %v", err)
+	}
+
+	if err := store.DeleteUser(ctx, id); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("expected ErrUserNotFound on repeated delete, got: %v", err)
+	}
+
+	if err := store.DeleteUser(ctx, ""); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput on empty user ID, got: %v", err)
+	}
+}
+
+
 
 

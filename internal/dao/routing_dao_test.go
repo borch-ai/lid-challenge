@@ -151,6 +151,7 @@ type mockErrorDAO struct {
 	getProfErr error
 	getCredErr error
 	verifyErr  error
+	deleteErr  error
 	upCount    int
 	downCount  int
 	versionErr error
@@ -161,6 +162,13 @@ func (m *mockErrorDAO) CreateUser(ctx context.Context, profile *models.UserProfi
 		return "", m.createErr
 	}
 	return "mock-id", nil
+}
+
+func (m *mockErrorDAO) DeleteUser(ctx context.Context, userID string) error {
+	if m.deleteErr != nil {
+		return m.deleteErr
+	}
+	return nil
 }
 
 func (m *mockErrorDAO) SearchProfiles(ctx context.Context, query models.SearchQuery) ([]*models.UserProfile, error) {
@@ -1438,6 +1446,77 @@ func TestRoutingDAO_SecondaryUsernameConflict_FailsCreate(t *testing.T) {
 	}
 	if secondaryErrorOp != "CreateUser" || !errors.Is(secondaryErrorCaptured, ErrUsernameTaken) {
 		t.Errorf("expected secondary error callback with ErrUsernameTaken, got op: %q, err: %v", secondaryErrorOp, secondaryErrorCaptured)
+	}
+	// Verify primary record was compensated (deleted) so primary datastore remains clean
+	if _, err := primary.GetCredential(ctx, "conflict_user"); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("expected primary record to be rolled back after secondary conflict, got: %v", err)
+	}
+}
+
+func TestRoutingDAO_SecondaryIDConflict_RollsBackPrimary(t *testing.T) {
+	ctx := context.Background()
+	hash, _ := security.HashPassword("secretpass")
+
+	primary, _ := NewSQLiteDAO("file::memory:?cache=shared")
+	defer func() { _ = primary.Close() }()
+	_ = primary.Migrate(ctx)
+
+	// mockSecondary returns ErrUserNotFound on GetProfile/GetCredential,
+	// but returns ErrInvalidInput on CreateUser (simulating duplicate caller-supplied ID).
+	mockSecondary := &mockErrorDAO{createErr: ErrInvalidInput}
+
+	r, err := NewRoutingDAO(PersistenceModeDualWrite, primary, mockSecondary, nil)
+	if err != nil {
+		t.Fatalf("failed to create routing dao: %v", err)
+	}
+
+	prof := &models.UserProfile{ID: "dup-id-1", Name: "Dup ID User", Phone: "+1-555-0888"}
+	cred := &models.UserCredential{Username: "dupid_user", PasswordHash: hash}
+
+	_, err = r.CreateUser(ctx, prof, cred)
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput when secondary rejects with duplicate ID, got: %v", err)
+	}
+	// Primary must have executed compensating rollback
+	if _, err := primary.GetProfile(ctx, "dup-id-1"); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("expected primary profile to be rolled back after secondary ID conflict, got: %v", err)
+	}
+	if _, err := primary.GetCredential(ctx, "dupid_user"); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("expected primary credential to be rolled back after secondary ID conflict, got: %v", err)
+	}
+}
+
+func TestRoutingDAO_PreflightProfileIDConflict(t *testing.T) {
+	ctx := context.Background()
+	hash, _ := security.HashPassword("secretpass")
+
+	sqliteDAO, _ := NewSQLiteDAO("file::memory:?cache=shared")
+	defer func() { _ = sqliteDAO.Close() }()
+	_ = sqliteDAO.Migrate(ctx)
+
+	nosqlDAO, _ := NewNoSQLDAO("memory://")
+	defer func() { _ = nosqlDAO.Close() }()
+	_ = nosqlDAO.Migrate(ctx)
+
+	// Prepopulate NoSQL with ID "existing-id"
+	_, err := nosqlDAO.CreateUser(ctx, &models.UserProfile{ID: "existing-id", Name: "Existing NoSQL", Phone: "111"}, &models.UserCredential{Username: "u_existing", PasswordHash: hash})
+	if err != nil {
+		t.Fatalf("failed prepopulating NoSQL: %v", err)
+	}
+
+	r, err := NewRoutingDAO(PersistenceModeSQLOnly, sqliteDAO, nosqlDAO, nil)
+	if err != nil {
+		t.Fatalf("failed to create routing dao: %v", err)
+	}
+
+	// Attempt to create user with same ID in SQL-only mode
+	_, err = r.CreateUser(ctx, &models.UserProfile{ID: "existing-id", Name: "New SQL", Phone: "222"}, &models.UserCredential{Username: "new_username", PasswordHash: hash})
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput on preflight profile ID conflict, got: %v", err)
+	}
+	// Verify primary SQL was never written to
+	if _, err := sqliteDAO.GetProfile(ctx, "existing-id"); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("expected primary SQL store to remain empty, got: %v", err)
 	}
 }
 
